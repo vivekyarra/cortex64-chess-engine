@@ -1,2005 +1,795 @@
+"""Main gameplay screen for the Cortex64 v2 interface."""
+
 from __future__ import annotations
 
-import json
-import math
-import multiprocessing as mp
 import threading
-import time
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from queue import Empty
-from typing import Dict, List, Optional, Tuple
+from dataclasses import replace
 
 import pygame
 
-from ai.evaluate import NeuralEvaluator
-from engine.board import (
-    BISHOP,
-    BLACK,
-    EMPTY,
-    KNIGHT,
-    Move,
-    QUEEN,
-    ROOK,
-    WHITE,
-    Board,
-    piece_color,
-)
-from engine.minimax import find_best_move
+from engine.board import BISHOP, BLACK, Board, KNIGHT, Move, QUEEN, ROOK, WHITE, piece_color, square_name
 from engine.move_generator import generate_legal_moves, is_checkmate, is_in_check, is_stalemate, legal_moves_from
+from gui import theme
+from gui.animation import AnimationManager
+from gui.components import Button, ChessClock, EvalBar, MoveList, PlayerCard
+from gui.constants import (
+    ACCENT,
+    ANIM_FADE_MS,
+    ANIM_PIECE_MS,
+    ANIM_PULSE_MS,
+    ANIM_SHAKE_MS,
+    BG_CARD,
+    BG_DARK,
+    BG_SURFACE,
+    BOARD_OFFSET_X,
+    BOARD_OFFSET_Y,
+    BOARD_SIZE,
+    DANGER,
+    GOLD,
+    MUTED,
+    SIDEBAR_LEFT_W,
+    SQUARE_SIZE,
+    SUCCESS,
+    WARNING,
+    WHITE_COL,
+)
+from gui.search import MaterialEvaluator, classify_quality, create_evaluator, evaluate_move_delta, search_best_move_with_budget
+from gui.state import GameConfig, GameSummary, MoveRecord, save_profile
+from gui.ui_utils import draw_arrow, fit_text, load_piece_images
+
+PIECE_LETTERS = {1: "", 2: "N", 3: "B", 4: "R", 5: "Q", 6: "K"}
 
 
-BOARD_SIZE = 520
-SQUARE_SIZE = 65
+class GameScreen:
+    """Interactive chess game view with sidebars, animations, and AI."""
 
-LEFT_MARGIN = 24
-TOP_MARGIN = 70
-RIGHT_PANEL_GAP = 20
-RIGHT_PANEL_WIDTH = 340
-BOTTOM_MARGIN = 90
-
-WINDOW_WIDTH = LEFT_MARGIN + BOARD_SIZE + RIGHT_PANEL_GAP + RIGHT_PANEL_WIDTH + 36
-WINDOW_HEIGHT = TOP_MARGIN + BOARD_SIZE + BOTTOM_MARGIN
-
-BOARD_LEFT = LEFT_MARGIN
-BOARD_TOP = TOP_MARGIN
-
-LIGHT_SQUARE = (206, 222, 236)
-DARK_SQUARE = (88, 145, 188)
-BOARD_BORDER = (22, 60, 78)
-
-SELECTED_BORDER = (45, 190, 255)
-LAST_MOVE_FROM = (236, 242, 112, 88)
-LAST_MOVE_TO = (236, 242, 112, 136)
-LEGAL_MOVE_DOT = (30, 38, 46)
-LEGAL_CAPTURE_DOT = (196, 80, 72)
-HINT_ARROW_COLOR = (169, 225, 80, 180)
-
-PANEL_BG = (8, 36, 54, 210)
-CARD_BG = (12, 49, 73, 220)
-TEXT_PRIMARY = (238, 246, 250)
-TEXT_MUTED = (168, 196, 210)
-ACCENT = (68, 199, 255)
-BUTTON_BG = (21, 67, 89)
-BUTTON_BG_HOVER = (31, 89, 118)
-BUTTON_BG_DISABLED = (37, 52, 63)
-
-PIECE_IMAGE_FILES = {
-    1: "wp.png",
-    2: "wn.png",
-    3: "wb.png",
-    4: "wr.png",
-    5: "wq.png",
-    6: "wk.png",
-    -1: "bp.png",
-    -2: "bn.png",
-    -3: "bb.png",
-    -4: "br.png",
-    -5: "bq.png",
-    -6: "bk.png",
-}
-
-FALLBACK_PIECE_LABELS = {
-    1: "P",
-    2: "N",
-    3: "B",
-    4: "R",
-    5: "Q",
-    6: "K",
-    -1: "p",
-    -2: "n",
-    -3: "b",
-    -4: "r",
-    -5: "q",
-    -6: "k",
-}
-
-MOVE_QUALITY_THRESHOLDS = {"best": 0.08, "normal": 0.25}
-AI_MOVE_TIME_LIMIT_SEC = 1.8
-POSTGAME_ANALYSIS_BUDGET_SEC = 1.8
-MOVE_FEEDBACK_DURATION_SEC = 2.2
-PROFILE_FILENAME = "profile.json"
-EXPORTS_DIRNAME = "exports"
-MATERIAL_VALUES = {
-    1: 1.0,   # pawn
-    2: 3.2,   # knight
-    3: 3.35,  # bishop
-    4: 5.1,   # rook
-    5: 9.4,   # queen
-    6: 0.0,   # king (safety handled implicitly by checkmate in search)
-}
-
-
-class MaterialEvaluator:
-    """
-    Fast deterministic evaluator used when no trained CNN model is available.
-    """
-
-    def __init__(self, model_path: str = "") -> None:
-        self.model_path = model_path
-        self.loaded = False
-
-    def evaluate(self, board: Board) -> float:
-        score = 0.0
-        for row in range(8):
-            for col in range(8):
-                piece = int(board.squares[row, col])
-                if piece == EMPTY:
-                    continue
-
-                piece_type = abs(piece)
-                base = MATERIAL_VALUES.get(piece_type, 0.0)
-                sign = 1.0 if piece > 0 else -1.0
-
-                # Light positional shaping for stronger play without neural weights.
-                center_distance = abs(3.5 - row) + abs(3.5 - col)
-                if piece_type == 1:  # pawn
-                    advance = (6 - row) if piece > 0 else (row - 1)
-                    base += 0.06 * advance
-                elif piece_type in (2, 3):  # knight / bishop
-                    base += max(0.0, 0.22 - 0.04 * center_distance)
-                elif piece_type == 4:  # rook on open-ish files
-                    base += 0.04 * max(0, 3 - abs(3.5 - col))
-                elif piece_type == 5:  # queen centralization late helps
-                    base += max(0.0, 0.12 - 0.025 * center_distance)
-
-                score += sign * base
-        return score
-
-
-def _create_search_evaluator(model_path: str):
-    neural = NeuralEvaluator(model_path=model_path)
-    if neural.loaded:
-        return neural
-    return MaterialEvaluator(model_path=model_path)
-
-
-def _timed_search_worker(
-    board: Board,
-    max_depth: int,
-    model_path: str,
-    use_neural_model: bool,
-    out_queue: mp.Queue,
-) -> None:
-    """
-    Run iterative deepening in a child process.
-    The parent enforces wall-time by terminating this process if needed.
-    """
-    evaluator = NeuralEvaluator(model_path=model_path) if use_neural_model else MaterialEvaluator(model_path=model_path)
-    if use_neural_model and not evaluator.loaded:
-        evaluator = MaterialEvaluator(model_path=model_path)
-    for depth in range(1, max(1, max_depth) + 1):
-        result = find_best_move(board.copy(), depth=depth, evaluator=evaluator)
-        out_queue.put((depth, result.move, float(result.score), int(result.nodes)))
-
-
-@dataclass
-class PromotionChoice:
-    from_sq: int
-    to_sq: int
-    options: List[Move]
-
-
-@dataclass
-class UIButton:
-    key: str
-    label: str
-    rect: pygame.Rect
-
-
-class Game:
-    def __init__(
-        self,
-        ai_depth: int = 12,
-        ai_move_time_limit: float = AI_MOVE_TIME_LIMIT_SEC,
-        human_color: int = WHITE,
-        model_path: str = "ai/models/chess_cnn.pt",
-        window_size: int = BOARD_SIZE,
-        fps: int = 60,
-    ) -> None:
-        pygame.init()
-        pygame.display.set_caption("Cortex64")
-
-        self.window_size = BOARD_SIZE
-        self.board_px = BOARD_SIZE
-        self.square_size = SQUARE_SIZE
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        self.clock = pygame.time.Clock()
-        self.fps = fps
-
+    def __init__(self, screen: pygame.Surface, app_state, config: GameConfig) -> None:
+        self.screen = screen
+        self.app = app_state
+        self.config = replace(config, settings=dict(config.settings or self.app.settings))
         self.board = Board()
-        self.human_color = human_color
-        self.ai_color = -human_color
-        self.ai_depth = max(1, ai_depth)
-        self.evaluator = _create_search_evaluator(model_path=model_path)
-        self.use_neural_model = bool(getattr(self.evaluator, "loaded", False))
-        self.eval_label = "CNN" if self.use_neural_model else "Material"
+        self.human_color = WHITE if self.config.human == "white" else BLACK
+        self.ai_color = -self.human_color if self.config.has_ai else None
+        self.animation = AnimationManager()
+        self.piece_images = load_piece_images(SQUARE_SIZE)
+        self.evaluator = create_evaluator(self.config.model or self.app.model_path)
+        self.quality_evaluator = MaterialEvaluator(self.config.model or self.app.model_path or "")
+        self.profile_name = self.config.username or "Soprano"
 
-        self.profile_path = Path(__file__).resolve().parent / "data" / PROFILE_FILENAME
-        self.exports_dir = Path(__file__).resolve().parent / EXPORTS_DIRNAME
-        self.total_games = 0
-        self.total_wins = 0
-        self.total_losses = 0
-        self.total_draws = 0
-
-        self.user_name = "Soprano"
-        self.ai_name = "Cortex64"
-        self.editing_name = False
-        self.awaiting_start_choice = True
-
-        self.selected_sq: Optional[int] = None
-        self.selected_moves: List[Move] = []
-        self.promotion: Optional[PromotionChoice] = None
-        self.last_move: Optional[Move] = None
-        self.hint_move: Optional[Move] = None
-        self.move_history: List[Move] = []
-
-        self.game_state = "playing"
-        self.status_text = ""
-        self.game_over = False
-
-        self.end_title = ""
-        self.end_reason = ""
-        self.popup_visible = False
-        self.popup_anim = 0.0
-        self.popup_close_rect: Optional[pygame.Rect] = None
-        self.popup_rematch_rect: Optional[pygame.Rect] = None
-        self.popup_continue_rect: Optional[pygame.Rect] = None
-        self.popup_switch_rect: Optional[pygame.Rect] = None
-        self.popup_analyze_rect: Optional[pygame.Rect] = None
-        self.popup_export_rect: Optional[pygame.Rect] = None
-        self.popup_analysis_prev_rect: Optional[pygame.Rect] = None
-        self.popup_analysis_next_rect: Optional[pygame.Rect] = None
-        self.popup_analysis_back_rect: Optional[pygame.Rect] = None
-        self.rematch_choice_visible = False
-        self.analysis_mode_active = False
-        self.analysis_view_index = 0
-        self.analysis_view_board: Optional[Board] = None
-        self.analysis_records: List[Dict[str, object]] = []
-        self.popup_notice = ""
-        self.popup_notice_until = 0.0
-        self.postgame_stats = self._empty_postgame_stats()
-        self.last_result = ""
-
-        # Session scoreboard resets naturally every app run.
-        self.session_games = 0
-        self.session_user_wins = 0
-        self.session_ai_wins = 0
-        self.session_draws = 0
+        self.move_history: list[Move] = []
+        self.move_records: list[MoveRecord] = []
+        self.eval_history: list[float] = []
+        self.selected_sq: int | None = None
+        self.selected_moves: list[Move] = []
+        self.last_move: Move | None = None
+        self.drag_sq: int | None = None
+        self.drag_piece: int | None = None
+        self.drag_origin: tuple[int, int] | None = None
+        self.drag_pos: tuple[int, int] | None = None
+        self.dragging = False
+        self.pending_promotion: tuple[int, int, list[Move]] | None = None
+        self.hint_move: Move | None = None
+        self.hint_explanation = ""
+        self.hint_until = 0
+        self.hint_fade_end = 0
+        self.hidden_anim_to_sq: int | None = None
 
         self.ai_thinking = False
-        self.ai_start_ts = 0.0
+        self.ai_result = None
+        self.ai_lock = threading.Lock()
+        self.ai_thread: threading.Thread | None = None
         self.ai_last_time = 0.0
-        self.ai_last_depth = 0
         self.ai_last_nodes = 0
-        self.ai_last_eval_white = 0.0
-        self.ai_task_id = 0
-        self.ai_thread: Optional[threading.Thread] = None
-        self.ai_result_payload: Optional[Tuple[int, Optional[Move], float, int, float, int]] = None
-        self.ai_result_lock = threading.Lock()
-        self.ai_move_time_limit = max(0.4, float(ai_move_time_limit))
+        self.ai_last_depth = 0
+        self.ai_last_eval_cp = 0.0
+        self.ai_stats_expanded = False
 
-        self.analysis_in_progress = False
-        self.analysis_task_id = 0
-        self.analysis_thread: Optional[threading.Thread] = None
-        self.analysis_result_payload: Optional[Tuple[int, Dict[str, Dict[str, int]], List[Dict[str, object]]]] = None
-        self.analysis_lock = threading.Lock()
+        self.total_elapsed_ms = 0
+        self.status_text = ""
+        self.banner_text = ""
+        self.banner_until = 0
+        self.confirm_resign = False
+        self.results_summary: GameSummary | None = None
+        self.results_pending = False
+        self.results_ready = False
 
-        self.hint_explanation = ""
-        self.move_feedback_text = ""
-        self.move_feedback_until = 0.0
-        self.move_feedback_color = TEXT_MUTED
+        self.font_scale = 1.15 if self.config.settings.get("font_size") == "large" else 1.0
+        self.title_font = pygame.font.SysFont("segoeui", int(24 * self.font_scale), bold=True)
+        self.body_font = pygame.font.SysFont("segoeui", int(16 * self.font_scale))
+        self.small_font = pygame.font.SysFont("segoeui", int(14 * self.font_scale))
 
-        self.font_title = pygame.font.SysFont("segoeui", 34, bold=True)
-        self.font_panel_title = pygame.font.SysFont("segoeui", 28, bold=True)
-        self.font_name = pygame.font.SysFont("segoeui", 24, bold=True)
-        self.font_player = pygame.font.SysFont("segoeui", 20, bold=True)
-        self.font_body = pygame.font.SysFont("segoeui", 22)
-        self.font_small = pygame.font.SysFont("segoeui", 18)
-        self.font_button = pygame.font.SysFont("segoeui", 22, bold=True)
-        self.font_board = pygame.font.SysFont("consolas", 16, bold=True)
+        self.board_rect = pygame.Rect(BOARD_OFFSET_X, BOARD_OFFSET_Y, BOARD_SIZE, BOARD_SIZE)
+        self.left_rect = pygame.Rect(0, 0, SIDEBAR_LEFT_W, 800)
+        self.right_rect = pygame.Rect(860, 0, 420, 800)
+        self.eval_bar = EvalBar((54, 150, 50, 310))
+        self.move_list = MoveList((888, 128, 364, 400))
+        self.opp_card = PlayerCard((18, 26, 144, 92), self._opponent_name(), self._opponent_rating(), self._opponent_color_name())
+        self.player_card = PlayerCard((18, 626, 144, 92), self.profile_name if self.config.has_ai else self._player_name(), self._player_rating(), self._player_color_name())
+        self.stats_rect = pygame.Rect(888, 542, 364, 92)
+        self.undo_button = Button((888, 692, 112, 42), "Undo", icon="↩")
+        self.hint_button = Button((1014, 692, 112, 42), "Hint", icon="💡")
+        self.resign_button = Button((1140, 692, 112, 42), "Resign", icon="⚑", color=DANGER)
+        self.confirm_yes = Button((0, 0, 120, 40), "Confirm", color=DANGER)
+        self.confirm_no = Button((0, 0, 120, 40), "Cancel", color=BG_CARD)
 
-        self.board_rect = pygame.Rect(BOARD_LEFT, BOARD_TOP, self.board_px, self.board_px)
-        self.ai_panel_rect = pygame.Rect(BOARD_LEFT, max(6, BOARD_TOP - 62), self.board_px, 58)
-        self.user_panel_rect = pygame.Rect(BOARD_LEFT, BOARD_TOP + self.board_px + 16, self.board_px, 58)
-        self.right_panel_rect = pygame.Rect(BOARD_LEFT + self.board_px + RIGHT_PANEL_GAP, 10, RIGHT_PANEL_WIDTH, WINDOW_HEIGHT - 20)
-        self.user_name_input_rect = pygame.Rect(self.user_panel_rect.x + 90, self.user_panel_rect.y + 12, 400, 34)
+        self.clock = None
+        if self.config.time_control and self.config.time_control.enabled:
+            tc = self.config.time_control
+            self.clock = ChessClock(tc.initial_ms, tc.initial_ms, tc.increment_ms)
+            self.clock.start("white")
 
-        button_w = 104
-        button_h = 56
-        button_gap = 14
-        total_w = 3 * button_w + 2 * button_gap
-        start_x = self.right_panel_rect.x + (self.right_panel_rect.width - total_w) // 2
-        start_y = self.right_panel_rect.bottom - button_h - 26
-        self.buttons: Dict[str, UIButton] = {
-            "undo": UIButton("undo", "Undo", pygame.Rect(start_x, start_y, button_w, button_h)),
-            "hint": UIButton("hint", "Hint", pygame.Rect(start_x + button_w + button_gap, start_y, button_w, button_h)),
-            "resign": UIButton("resign", "Resign", pygame.Rect(start_x + 2 * (button_w + button_gap), start_y, button_w, button_h)),
-        }
-        self.move_list_row_height = 22
-        self.move_list_scroll = 0
-        self.move_list_auto_follow = True
-        self.move_list_rect = self._recalculate_move_list_rect()
+        if self.app.sound_manager is not None:
+            self.app.sound_manager.set_enabled(bool(self.config.settings.get("sound", True)))
 
-        self.background = self._build_background_surface()
-        self.piece_images = self._load_piece_images()
-        self.cortex_avatar = self._load_avatar("cortex.png", 40, "C", (82, 164, 132))
+        self._set_status()
+        self._update_eval()
 
-        setup_w, setup_h = 500, 280
-        self.setup_panel_rect = pygame.Rect((WINDOW_WIDTH - setup_w) // 2, (WINDOW_HEIGHT - setup_h) // 2, setup_w, setup_h)
-        self.setup_name_input_rect = pygame.Rect(self.setup_panel_rect.x + 90, self.setup_panel_rect.y + 78, 300, 42)
-        self.setup_white_rect = pygame.Rect(self.setup_panel_rect.x + 68, self.setup_panel_rect.y + 194, 150, 52)
-        self.setup_black_rect = pygame.Rect(self.setup_panel_rect.x + 282, self.setup_panel_rect.y + 194, 150, 52)
+    def _opponent_name(self) -> str:
+        if self.config.has_ai:
+            return "Cortex64"
+        return "Black" if self.config.human == "white" else "White"
 
-        _ = window_size
-        self._load_profile()
-        self.analysis_view_board = self.board.copy()
-        self.status_text = "Choose White or Black to start."
+    def _player_name(self) -> str:
+        return "White" if self.config.human == "white" else "Black"
 
-    def _empty_postgame_stats(self) -> Dict[str, Dict[str, int]]:
-        return {"user": {"best": 0, "normal": 0, "worst": 0}, "ai": {"best": 0, "normal": 0, "worst": 0}}
+    def _opponent_color_name(self) -> str:
+        return "black" if self.config.human == "white" else "white"
 
-    def _default_profile(self) -> Dict[str, object]:
-        return {
-            "username": "Soprano",
-            "games_played": 0,
-            "wins": 0,
-            "losses": 0,
-            "draws": 0,
-            "preferred_side": "white",
-        }
+    def _player_color_name(self) -> str:
+        return "white" if self.config.human == "white" else "black"
 
-    def _load_profile(self) -> None:
-        data = self._default_profile()
-        if self.profile_path.exists():
-            try:
-                with self.profile_path.open("r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data.update(loaded)
-            except Exception:
-                pass
+    def _opponent_rating(self) -> int:
+        return 2140 if self.config.has_ai else 1200
 
-        self.user_name = str(data.get("username", "Soprano")).strip() or "Soprano"
-        self.total_games = int(data.get("games_played", 0))
-        self.total_wins = int(data.get("wins", 0))
-        self.total_losses = int(data.get("losses", 0))
-        self.total_draws = int(data.get("draws", 0))
-        side = str(data.get("preferred_side", "white")).lower()
-        self.human_color = WHITE if side != "black" else BLACK
-        self.ai_color = -self.human_color
+    def _player_rating(self) -> int:
+        wins = int(self.app.profile.get("wins", 0))
+        losses = int(self.app.profile.get("losses", 0))
+        return max(800, 1200 + wins * 8 - losses * 5)
 
-    def _save_profile(self) -> None:
-        side = "white" if self.human_color == WHITE else "black"
-        payload = {
-            "username": self.user_name.strip() or "Soprano",
-            "games_played": int(self.total_games),
-            "wins": int(self.total_wins),
-            "losses": int(self.total_losses),
-            "draws": int(self.total_draws),
-            "preferred_side": side,
-        }
-        try:
-            self.profile_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.profile_path.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-        except Exception:
-            pass
+    def _animation_duration(self, base: int) -> int:
+        mode = self.config.settings.get("animations", "normal")
+        if mode == "off":
+            return 0
+        if mode == "fast":
+            return max(40, base // 2)
+        return base
 
-    def _set_popup_notice(self, text: str, duration: float = 2.8) -> None:
-        self.popup_notice = text
-        self.popup_notice_until = time.time() + max(0.8, duration)
+    def _board_flipped(self) -> bool:
+        return self.config.human == "black"
 
-    def _game_result_code(self) -> str:
-        if self.last_result == "user":
-            return "1-0" if self.human_color == WHITE else "0-1"
-        if self.last_result == "ai":
-            return "0-1" if self.human_color == WHITE else "1-0"
-        return "1/2-1/2"
+    def _board_to_display(self, row: int, col: int) -> tuple[int, int]:
+        return (7 - row, 7 - col) if self._board_flipped() else (row, col)
 
-    def _export_game_pgn(self) -> Optional[Path]:
-        white_name = self.user_name if self.human_color == WHITE else self.ai_name
-        black_name = self.ai_name if self.human_color == WHITE else self.user_name
-        result = self._game_result_code()
-        date_hdr = datetime.now().strftime("%Y.%m.%d")
+    def _display_to_board(self, row: int, col: int) -> tuple[int, int]:
+        return (7 - row, 7 - col) if self._board_flipped() else (row, col)
 
-        move_tokens: List[str] = []
-        for i in range(0, len(self.move_history), 2):
-            move_tokens.append(f"{i // 2 + 1}.")
-            move_tokens.append(self.move_history[i].uci())
-            if i + 1 < len(self.move_history):
-                move_tokens.append(self.move_history[i + 1].uci())
-        move_tokens.append(result)
-
-        pgn = "\n".join(
-            [
-                '[Event "Cortex64 Single Player"]',
-                '[Site "Local"]',
-                f'[Date "{date_hdr}"]',
-                f'[White "{white_name}"]',
-                f'[Black "{black_name}"]',
-                f'[Result "{result}"]',
-                "",
-                " ".join(move_tokens),
-                "",
-            ]
+    def _square_rect(self, square: int, with_shake: bool = False) -> pygame.Rect:
+        row, col = divmod(square, 8)
+        row, col = self._board_to_display(row, col)
+        shake = self.animation.get_shake_offset_x() if with_shake else 0
+        return pygame.Rect(
+            self.board_rect.x + shake + col * SQUARE_SIZE,
+            self.board_rect.y + row * SQUARE_SIZE,
+            SQUARE_SIZE,
+            SQUARE_SIZE,
         )
 
-        try:
-            self.exports_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out = self.exports_dir / f"cortex64_{stamp}.pgn"
-            out.write_text(pgn, encoding="utf-8")
-            return out
-        except Exception:
+    def _square_center(self, square: int) -> tuple[int, int]:
+        return self._square_rect(square).center
+
+    def _square_from_mouse(self, pos: tuple[int, int]) -> int | None:
+        shake = self.animation.get_shake_offset_x()
+        rect = self.board_rect.move(shake, 0)
+        if not rect.collidepoint(pos):
             return None
-
-    def _render_board(self) -> Board:
-        if self.popup_visible and self.analysis_mode_active and self.analysis_view_board is not None:
-            return self.analysis_view_board
-        return self.board
-
-    def _build_board_at_ply(self, ply_index: int) -> Board:
-        idx = max(0, min(len(self.move_history), ply_index))
-        board = Board()
-        for i in range(idx):
-            board.push(self.move_history[i])
-        return board
-
-    def _set_analysis_index(self, new_index: int) -> None:
-        self.analysis_view_index = max(0, min(len(self.move_history), int(new_index)))
-        self.analysis_view_board = self._build_board_at_ply(self.analysis_view_index)
-
-    def _enter_analysis_mode(self) -> None:
-        if not self.popup_visible:
-            return
-        self.analysis_mode_active = True
-        self.rematch_choice_visible = False
-        self._set_analysis_index(len(self.move_history))
-
-    def _leave_analysis_mode(self) -> None:
-        self.analysis_mode_active = False
-        self.popup_analysis_prev_rect = None
-        self.popup_analysis_next_rect = None
-        self.popup_analysis_back_rect = None
-        self.analysis_view_board = self.board.copy()
-
-    def _captured_piece_for_move(self, board: Board, move: Move) -> int:
-        if move.is_en_passant:
-            direction = -8 if board.side_to_move == BLACK else 8
-            return board.piece_at(move.to_sq + direction)
-        return board.piece_at(move.to_sq)
-
-    def _count_checking_moves(self, board: Board, attacker_color: int, defender_color: int) -> int:
-        probe = board.copy()
-        probe.side_to_move = attacker_color
-        count = 0
-        for candidate in generate_legal_moves(probe):
-            probe.push(candidate)
-            if is_in_check(probe, defender_color):
-                count += 1
-            probe.pop()
-        return count
-
-    def _build_hint_explanation(self, board_before: Board, move: Move) -> str:
-        mover = board_before.side_to_move
-        board_after = board_before.copy()
-        board_after.push(move)
-
-        if is_checkmate(board_after):
-            return "Check or mate threat: this move is immediate checkmate."
-        if is_in_check(board_before, mover) and not is_in_check(board_after, mover):
-            return "Threat prevention: this move gets your king out of danger."
-
-        captured = self._captured_piece_for_move(board_before, move)
-        captured_value = MATERIAL_VALUES.get(abs(captured), 0.0)
-        if captured != EMPTY and captured_value > 0.0:
-            return f"Material gain: wins about {captured_value:.1f} points."
-
-        if move.is_castling or (abs(board_before.piece_at(move.from_sq)) == 6 and not is_in_check(board_after, mover)):
-            return "King safety improvement: king position becomes safer."
-
-        if is_in_check(board_after, -mover):
-            return "Check threat: puts the opponent king in check."
-
-        checks_before = self._count_checking_moves(board_before, -mover, mover)
-        checks_after = self._count_checking_moves(board_after, -mover, mover)
-        if checks_after < checks_before:
-            return "Threat prevention: reduces opponent checking chances."
-
-        eval_before = float(mover) * float(self.evaluator.evaluate(board_before))
-        eval_after = float(mover) * float(self.evaluator.evaluate(board_after))
-        delta = eval_after - eval_before
-        if delta >= 0.12:
-            return f"Positional gain: improves evaluation by {delta:+.2f}."
-        return "Solid move: keeps the position stable."
-
-    def _evaluate_move_delta(self, board_before: Board, move: Move, depth: int = 1) -> float:
-        analysis_depth = max(1, depth)
-        best_result = find_best_move(board_before.copy(), depth=analysis_depth, evaluator=self.evaluator)
-        best_score = float(best_result.score) if best_result.move is not None else 0.0
-
-        board_after = board_before.copy()
-        board_after.push(move)
-        if is_checkmate(board_after):
-            played_score = 1000.0
-        else:
-            reply = find_best_move(board_after.copy(), depth=analysis_depth, evaluator=self.evaluator)
-            played_score = 0.0 if reply.move is None else -float(reply.score)
-        return max(0.0, best_score - played_score)
-
-    def _set_move_feedback_from_delta(self, delta: float) -> None:
-        quality = self._classify_move_delta(delta)
-        if quality == "best":
-            self.move_feedback_text = "Good move"
-            self.move_feedback_color = (126, 214, 151)
-        elif quality == "normal":
-            self.move_feedback_text = "Inaccuracy"
-            self.move_feedback_color = (244, 200, 108)
-        else:
-            self.move_feedback_text = "Mistake"
-            self.move_feedback_color = (236, 123, 110)
-        self.move_feedback_until = time.time() + MOVE_FEEDBACK_DURATION_SEC
-
-    def _asset_path(self, relative: str) -> Optional[Path]:
-        base = Path(__file__).resolve().parent
-        for root in ("assets", "assests"):
-            candidate = base / root / relative
-            if candidate.exists():
-                return candidate
-        return None
-
-    def _build_background_surface(self) -> pygame.Surface:
-        surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
-        h = WINDOW_HEIGHT - 1 if WINDOW_HEIGHT > 1 else 1
-        for y in range(WINDOW_HEIGHT):
-            t = y / h
-            r = int(6 + 10 * t)
-            g = int(40 + 28 * t)
-            b = int(56 + 44 * t)
-            pygame.draw.line(surface, (r, g, b), (0, y), (WINDOW_WIDTH, y))
-
-        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        for i in range(-2, 10):
-            x = i * 130
-            pygame.draw.polygon(overlay, (32, 124, 148, 18), [(x, 0), (x + 56, 0), (x + 360, WINDOW_HEIGHT), (x + 304, WINDOW_HEIGHT)])
-        pygame.draw.rect(overlay, (18, 80, 100, 32), self.right_panel_rect.inflate(30, 10), border_radius=22)
-        surface.blit(overlay, (0, 0))
-        return surface
-
-    def _recalculate_move_list_rect(self) -> pygame.Rect:
-        top = self.right_panel_rect.y + 368
-        button_top = min(button.rect.top for button in self.buttons.values())
-        bottom = button_top - 14
-        height = max(170, bottom - top)
-        return pygame.Rect(self.right_panel_rect.x + 18, top, self.right_panel_rect.width - 36, height)
-
-    def _is_board_flipped(self) -> bool:
-        return self.human_color == BLACK
-
-    def _board_to_display(self, row: int, col: int) -> Tuple[int, int]:
-        if self._is_board_flipped():
-            return 7 - row, 7 - col
-        return row, col
-
-    def _display_to_board(self, row: int, col: int) -> Tuple[int, int]:
-        if self._is_board_flipped():
-            return 7 - row, 7 - col
-        return row, col
-
-    def _create_piece_fallback(self, piece: int) -> pygame.Surface:
-        surf = pygame.Surface((self.square_size - 8, self.square_size - 8), pygame.SRCALPHA)
-        center = (surf.get_width() // 2, surf.get_height() // 2)
-        radius = min(center) - 2
-        fill = (244, 246, 248, 245) if piece > 0 else (22, 31, 41, 245)
-        stroke = (35, 57, 80) if piece > 0 else (220, 227, 234)
-        pygame.draw.circle(surf, fill, center, radius)
-        pygame.draw.circle(surf, stroke, center, radius, width=2)
-        label = FALLBACK_PIECE_LABELS.get(piece, "?")
-        txt = self.font_name.render(label, True, stroke if piece < 0 else (22, 35, 48))
-        surf.blit(txt, txt.get_rect(center=center))
-        return surf
-
-    def _load_piece_images(self) -> Dict[int, pygame.Surface]:
-        images: Dict[int, pygame.Surface] = {}
-        piece_px = self.square_size - 8
-        for piece, filename in PIECE_IMAGE_FILES.items():
-            img_path = self._asset_path(f"pieces/{filename}")
-            if img_path is None:
-                images[piece] = self._create_piece_fallback(piece)
-                continue
-            image = pygame.image.load(str(img_path)).convert_alpha()
-            images[piece] = pygame.transform.smoothscale(image, (piece_px, piece_px))
-        return images
-
-    def _make_avatar_fallback(self, size: int, label: str, fill_color: Tuple[int, int, int]) -> pygame.Surface:
-        surf = pygame.Surface((size, size), pygame.SRCALPHA)
-        center = (size // 2, size // 2)
-        pygame.draw.circle(surf, (12, 35, 47, 230), center, size // 2)
-        pygame.draw.circle(surf, fill_color, center, size // 2 - 2)
-        txt = self.font_name.render(label[:1].upper(), True, (245, 250, 252))
-        surf.blit(txt, txt.get_rect(center=center))
-        return surf
-
-    def _load_avatar(self, filename: str, size: int, fallback_label: str, fill_color: Tuple[int, int, int]) -> pygame.Surface:
-        path = self._asset_path(filename)
-        if path is None:
-            return self._make_avatar_fallback(size, fallback_label, fill_color)
-        image = pygame.image.load(str(path)).convert_alpha()
-        return pygame.transform.smoothscale(image, (size, size))
-
-    def _get_user_avatar(self, size: int) -> pygame.Surface:
-        initial = (self.user_name.strip()[:1] or "S").upper()
-        # Derive a stable but varied color from first letter.
-        hue_seed = ord(initial[0]) if initial else 83
-        r = 58 + (hue_seed * 17) % 60
-        g = 112 + (hue_seed * 11) % 70
-        b = 146 + (hue_seed * 7) % 70
-        return self._make_avatar_fallback(size, initial, (r, g, b))
-
-    def _square_from_mouse(self, pos: Tuple[int, int]) -> Optional[int]:
-        x, y = pos
-        if not self.board_rect.collidepoint(x, y):
-            return None
-        display_col = (x - self.board_rect.x) // self.square_size
-        display_row = (y - self.board_rect.y) // self.square_size
+        display_col = (pos[0] - rect.x) // SQUARE_SIZE
+        display_row = (pos[1] - rect.y) // SQUARE_SIZE
         row, col = self._display_to_board(display_row, display_col)
         return row * 8 + col
 
-    def _square_rect(self, square: int) -> pygame.Rect:
-        row, col = divmod(square, 8)
-        display_row, display_col = self._board_to_display(row, col)
-        return pygame.Rect(
-            self.board_rect.x + display_col * self.square_size,
-            self.board_rect.y + display_row * self.square_size,
-            self.square_size,
-            self.square_size,
-        )
+    def _captured_piece(self, board_before: Board, move: Move) -> int:
+        if move.is_en_passant:
+            direction = -8 if board_before.side_to_move == BLACK else 8
+            return board_before.piece_at(move.to_sq + direction)
+        return board_before.piece_at(move.to_sq)
 
-    def _square_center(self, square: int) -> Tuple[float, float]:
-        rect = self._square_rect(square)
-        return float(rect.centerx), float(rect.centery)
+    def _is_controlled_color(self, color: int) -> bool:
+        return True if not self.config.has_ai else color == self.human_color
 
-    def _draw_square_overlay(self, square: int, color: Tuple[int, int, int, int]) -> None:
-        rect = self._square_rect(square)
-        overlay = pygame.Surface((self.square_size, self.square_size), pygame.SRCALPHA)
-        overlay.fill(color)
-        self.screen.blit(overlay, rect.topleft)
+    def _is_human_turn(self) -> bool:
+        return self._is_controlled_color(self.board.side_to_move)
+
+    def _select_square(self, square: int | None) -> None:
+        self.selected_sq = square
+        self.selected_moves = legal_moves_from(self.board, square) if square is not None else []
 
     def _clear_selection(self) -> None:
         self.selected_sq = None
         self.selected_moves = []
 
-    def _is_human_turn(self) -> bool:
-        return self.board.side_to_move == self.human_color
+    def _set_status(self) -> None:
+        if is_checkmate(self.board):
+            self.status_text = "Checkmate"
+            return
+        if is_stalemate(self.board):
+            self.status_text = "Stalemate"
+            return
+        name = self.profile_name if self.board.side_to_move == self.human_color or not self.config.has_ai else "Cortex64"
+        if not self.config.has_ai:
+            name = "White" if self.board.side_to_move == WHITE else "Black"
+        suffix = " · check" if is_in_check(self.board, self.board.side_to_move) else ""
+        self.status_text = f"{name} to move{suffix}"
 
-    def _push_move(self, move: Move) -> None:
+    def _update_eval(self) -> None:
+        self.eval_bar.set_eval(float(self.quality_evaluator.evaluate(self.board)) * 100.0)
+
+    def _play_sound(self, name: str) -> None:
+        if self.app.sound_manager is not None:
+            self.app.sound_manager.play(name)
+
+    def _move_to_san(self, board_before: Board, move: Move) -> str:
+        piece = abs(board_before.piece_at(move.from_sq))
+        if move.is_castling:
+            san = "O-O" if move.to_sq % 8 == 6 else "O-O-O"
+        else:
+            capture = self._captured_piece(board_before, move) != 0
+            prefix = PIECE_LETTERS.get(piece, "")
+            if piece == 1 and capture:
+                prefix = square_name(move.from_sq)[0]
+
+            disambiguation = ""
+            if piece != 1:
+                similar = []
+                for candidate in generate_legal_moves(board_before):
+                    if candidate == move or candidate.to_sq != move.to_sq:
+                        continue
+                    if abs(board_before.piece_at(candidate.from_sq)) == piece:
+                        similar.append(candidate)
+                if similar:
+                    from_name = square_name(move.from_sq)
+                    same_file = any(square_name(other.from_sq)[0] == from_name[0] for other in similar)
+                    same_rank = any(square_name(other.from_sq)[1] == from_name[1] for other in similar)
+                    if not same_file:
+                        disambiguation = from_name[0]
+                    elif not same_rank:
+                        disambiguation = from_name[1]
+                    else:
+                        disambiguation = from_name
+
+            san = f"{prefix}{disambiguation}{'x' if capture else ''}{square_name(move.to_sq)}"
+            if move.promotion is not None:
+                san += f"={PIECE_LETTERS.get(abs(move.promotion), 'Q')}"
+
+        board_after = board_before.copy()
+        board_after.push(move)
+        if is_checkmate(board_after):
+            san += "#"
+        elif is_in_check(board_after, board_after.side_to_move):
+            san += "+"
+        return san
+
+    def _build_hint_explanation(self, board_before: Board, move: Move) -> str:
+        board_after = board_before.copy()
+        board_after.push(move)
+        captured = self._captured_piece(board_before, move)
+        if is_checkmate(board_after):
+            return "Mate threat — this move ends the game immediately."
+        if captured:
+            return f"Material gain — captures on {square_name(move.to_sq)}."
+        if move.is_castling:
+            return "King safety — tucks the king away and connects rooks."
+        if is_in_check(board_after, board_after.side_to_move):
+            return f"Threat — checks the king from {square_name(move.to_sq)}."
+        return "Development — improves coordination and central control."
+
+    def _mark_check(self) -> None:
+        if is_in_check(self.board, self.board.side_to_move):
+            king_sq = self.board.white_king_sq if self.board.side_to_move == WHITE else self.board.black_king_sq
+            pulse_ms = self._animation_duration(ANIM_PULSE_MS)
+            if pulse_ms:
+                self.animation.add_check_pulse(self._square_rect(king_sq).topleft, pulse_ms)
+            self.banner_text = "CHECK!"
+            self.banner_until = pygame.time.get_ticks() + 1500
+            self._play_sound("check")
+
+    def _apply_move(self, move: Move, actor: str) -> None:
+        board_before = self.board.copy()
+        moving_piece = board_before.piece_at(move.from_sq)
+        captured = self._captured_piece(board_before, move)
+        san = self._move_to_san(board_before, move)
+        delta_cp, best_uci = evaluate_move_delta(board_before, move, self.quality_evaluator, depth=1)
+        quality = classify_quality(delta_cp)
+        explanation = self._build_hint_explanation(board_before, move)
+
+        duration = self._animation_duration(ANIM_PIECE_MS)
+        if duration:
+            piece_surface = self.piece_images[moving_piece]
+            start_rect = self._square_rect(move.from_sq)
+            end_rect = self._square_rect(move.to_sq)
+            start_pos = (
+                start_rect.x + (SQUARE_SIZE - piece_surface.get_width()) // 2,
+                start_rect.y + (SQUARE_SIZE - piece_surface.get_height()) // 2,
+            )
+            end_pos = (
+                end_rect.x + (SQUARE_SIZE - piece_surface.get_width()) // 2,
+                end_rect.y + (SQUARE_SIZE - piece_surface.get_height()) // 2,
+            )
+            self.animation.add_piece_move(
+                piece_surface,
+                start_pos,
+                end_pos,
+                duration,
+            )
+            self.hidden_anim_to_sq = move.to_sq
+
         self.board.push(move)
         self.move_history.append(move)
         self.last_move = move
+        record = MoveRecord(
+            move=move,
+            san=san,
+            color="white" if piece_color(moving_piece) == WHITE else "black",
+            move_num=(len(self.move_history) + 1) // 2,
+            quality=quality,
+            eval_cp=float(self.quality_evaluator.evaluate(self.board)) * 100.0,
+            delta_cp=delta_cp,
+            best_move_uci=best_uci,
+            explanation=explanation,
+        )
+        self.move_records.append(record)
+        self.eval_history.append(record.eval_cp)
+        self.move_list.add_move(san, record.color, record.move_num, quality)
         self.hint_move = None
         self.hint_explanation = ""
-        self.move_list_auto_follow = True
         self._clear_selection()
-        self._update_turn_status()
+        self.pending_promotion = None
 
-    def _classify_move_delta(self, delta: float) -> str:
-        if delta <= MOVE_QUALITY_THRESHOLDS["best"]:
-            return "best"
-        if delta <= MOVE_QUALITY_THRESHOLDS["normal"]:
-            return "normal"
-        return "worst"
+        if self.clock is not None:
+            self.clock.press("white" if piece_color(moving_piece) == WHITE else "black")
+        self._play_sound("capture" if captured else "move")
+        self._update_eval()
+        self._mark_check()
+        self._set_status()
 
-    def _record_session_result(self) -> None:
-        self.session_games += 1
-        self.total_games += 1
-        if self.last_result == "user":
-            self.session_user_wins += 1
-            self.total_wins += 1
-        elif self.last_result == "ai":
-            self.session_ai_wins += 1
-            self.total_losses += 1
-        else:
-            self.session_draws += 1
-            self.total_draws += 1
-        self._save_profile()
-
-    def _search_best_move_with_budget(
-        self,
-        board_snapshot: Board,
-        max_depth: int,
-        budget_sec: float,
-    ) -> Tuple[Optional[Move], float, int, int, float]:
-        """
-        Return best move found within strict wall-time budget.
-        """
-        start = time.time()
-        budget = max(0.4, float(budget_sec))
-        deadline = start + budget
-
-        search_queue: mp.Queue = mp.Queue()
-        proc = mp.Process(
-            target=_timed_search_worker,
-            args=(board_snapshot, max_depth, self.evaluator.model_path, self.use_neural_model, search_queue),
-            daemon=True,
-        )
-        proc.start()
-
-        best_depth = 0
-        best_move: Optional[Move] = None
-        best_score = 0.0
-        best_nodes = 0
-
-        while time.time() < deadline:
-            timeout = min(0.05, max(0.0, deadline - time.time()))
-            if timeout <= 0:
-                break
-            try:
-                depth, move, score, nodes = search_queue.get(timeout=timeout)
-            except Empty:
-                if not proc.is_alive():
-                    break
-                continue
-
-            if move is not None:
-                best_depth = int(depth)
-                best_move = move
-                best_score = float(score)
-                best_nodes = int(nodes)
-
-        # Drain already-produced results quickly.
-        while True:
-            try:
-                depth, move, score, nodes = search_queue.get_nowait()
-            except Empty:
-                break
-            if move is not None:
-                best_depth = int(depth)
-                best_move = move
-                best_score = float(score)
-                best_nodes = int(nodes)
-
-        if proc.is_alive():
-            proc.terminate()
-        proc.join(timeout=0.2)
-        search_queue.close()
-        search_queue.cancel_join_thread()
-
-        if best_move is None:
-            fallback = find_best_move(board_snapshot.copy(), depth=1, evaluator=self.evaluator)
-            best_move = fallback.move
-            best_score = float(fallback.score)
-            best_nodes = int(fallback.nodes)
-            best_depth = 1 if fallback.move is not None else 0
-
-        elapsed = time.time() - start
-        return best_move, best_score, best_nodes, best_depth, elapsed
-
-    def _build_postgame_analysis(
-        self,
-        move_history: Optional[List[Move]] = None,
-        evaluator: Optional[object] = None,
-        max_duration_sec: float = POSTGAME_ANALYSIS_BUDGET_SEC,
-    ) -> Tuple[Dict[str, Dict[str, int]], List[Dict[str, object]]]:
-        # Uses engine evaluation deltas per move to classify quality for both sides.
-        stats_by_color: Dict[int, Dict[str, int]] = {
-            WHITE: {"best": 0, "normal": 0, "worst": 0},
-            BLACK: {"best": 0, "normal": 0, "worst": 0},
-        }
-        history = list(self.move_history) if move_history is None else list(move_history)
-        if not history:
-            return self._empty_postgame_stats(), []
-
-        eval_model = self.evaluator if evaluator is None else evaluator
-        analysis_depth = 1
-        deadline = time.time() + max(0.6, float(max_duration_sec))
-        analysis_board = Board()
-        analysis_records: List[Dict[str, object]] = []
-        for ply_index, played_move in enumerate(history, start=1):
-            mover = analysis_board.side_to_move
-            before_eval_white = float(eval_model.evaluate(analysis_board))
-            best_move_uci = "-"
-
-            if time.time() <= deadline:
-                best_result = find_best_move(analysis_board.copy(), depth=analysis_depth, evaluator=eval_model)
-                best_score = float(best_result.score) if best_result.move is not None else 0.0
-                if best_result.move is not None:
-                    best_move_uci = best_result.move.uci()
-
-                analysis_board.push(played_move)
-                if is_checkmate(analysis_board):
-                    played_score = 1000.0
-                else:
-                    reply_result = find_best_move(analysis_board.copy(), depth=analysis_depth, evaluator=eval_model)
-                    played_score = 0.0 if reply_result.move is None else -float(reply_result.score)
-            else:
-                # Budget fallback: classify from static evaluation drop so stats remain complete.
-                best_score = float(mover) * float(eval_model.evaluate(analysis_board))
-                analysis_board.push(played_move)
-                played_score = float(mover) * float(eval_model.evaluate(analysis_board))
-
-            after_eval_white = float(eval_model.evaluate(analysis_board))
-            delta = max(0.0, best_score - played_score)
-            quality = self._classify_move_delta(delta)
-            stats_by_color[mover][quality] += 1
-            analysis_records.append(
-                {
-                    "ply": ply_index,
-                    "side": "White" if mover == WHITE else "Black",
-                    "played": played_move.uci(),
-                    "best": best_move_uci,
-                    "eval_swing_white": round(after_eval_white - before_eval_white, 3),
-                    "delta": round(delta, 3),
-                    "quality": quality,
-                }
-            )
-
-        return {"user": stats_by_color[self.human_color], "ai": stats_by_color[self.ai_color]}, analysis_records
-
-    def _start_postgame_analysis(self) -> None:
-        self.analysis_task_id += 1
-        task_id = self.analysis_task_id
-        history_snapshot = list(self.move_history)
-        model_path = self.evaluator.model_path
-
-        self.analysis_in_progress = True
-        with self.analysis_lock:
-            self.analysis_result_payload = None
-
-        def worker() -> None:
-            local_eval = MaterialEvaluator(model_path=model_path)
-            stats, records = self._build_postgame_analysis(
-                move_history=history_snapshot,
-                evaluator=local_eval,
-                max_duration_sec=POSTGAME_ANALYSIS_BUDGET_SEC,
-            )
-            with self.analysis_lock:
-                self.analysis_result_payload = (task_id, stats, records)
-
-        self.analysis_thread = threading.Thread(target=worker, daemon=True)
-        self.analysis_thread.start()
-
-    def _cancel_postgame_analysis(self) -> None:
-        self.analysis_task_id += 1
-        self.analysis_in_progress = False
-        self.analysis_thread = None
-        with self.analysis_lock:
-            self.analysis_result_payload = None
-
-    def _poll_postgame_analysis(self) -> None:
-        if not self.analysis_in_progress:
-            return
-
-        with self.analysis_lock:
-            payload = self.analysis_result_payload
-        if payload is None:
-            return
-
-        task_id, stats, records = payload
-        if task_id != self.analysis_task_id:
-            with self.analysis_lock:
-                self.analysis_result_payload = None
-            return
-
-        self.analysis_in_progress = False
-        self.analysis_thread = None
-        self.postgame_stats = stats
-        self.analysis_records = records
-        with self.analysis_lock:
-            self.analysis_result_payload = None
-
-    def _finish_game(self, state: str) -> None:
-        if self.game_state != "playing":
-            return
-        if self.last_result not in {"user", "ai", "draw"}:
-            self.last_result = "draw"
-        self.game_state = state
-        self.game_over = True
-        self._record_session_result()
-        self.editing_name = False
-        self.popup_visible = True
-        self.popup_anim = 0.0
-        self.rematch_choice_visible = False
-        self._leave_analysis_mode()
-        self.analysis_records = []
-        self.popup_notice = ""
-        self.popup_notice_until = 0.0
-        self.popup_continue_rect = None
-        self.popup_switch_rect = None
-        self._cancel_ai_search()
-        self._cancel_postgame_analysis()
-        self.postgame_stats = self._empty_postgame_stats()
-        self._start_postgame_analysis()
-
-    def _reset_end_state(self) -> None:
-        self.game_state = "playing"
-        self.game_over = False
-        self.end_title = ""
-        self.end_reason = ""
-        self.popup_visible = False
-        self.popup_anim = 0.0
-        self.popup_close_rect = None
-        self.popup_rematch_rect = None
-        self.popup_continue_rect = None
-        self.popup_switch_rect = None
-        self.popup_analyze_rect = None
-        self.popup_export_rect = None
-        self.popup_analysis_prev_rect = None
-        self.popup_analysis_next_rect = None
-        self.popup_analysis_back_rect = None
-        self.rematch_choice_visible = False
-        self.analysis_mode_active = False
-        self.analysis_records = []
-        self.postgame_stats = self._empty_postgame_stats()
-        self.last_result = ""
-        self.analysis_view_board = self.board.copy()
-        self._cancel_postgame_analysis()
-
-    def _update_turn_status(self) -> None:
-        if self.game_state != "playing":
-            return
+        if actor == "human":
+            self.banner_text = {"good": "Good move", "inaccuracy": "Inaccuracy", "mistake": "Mistake"}[quality]
+            self.banner_until = pygame.time.get_ticks() + 1200
 
         if is_checkmate(self.board):
-            winner_color = -self.board.side_to_move
-            winner_name = self.user_name if winner_color == self.human_color else self.ai_name
-            self.status_text = f"Checkmate! {winner_name} wins."
-            self.end_title = "You Won" if winner_color == self.human_color else "You Lost"
-            self.end_reason = "Checkmate"
-            self.last_result = "user" if winner_color == self.human_color else "ai"
-            self._finish_game("ended")
+            winner = "white" if self.board.side_to_move == BLACK else "black"
+            self._finish_game("Checkmate", winner)
+        elif is_stalemate(self.board):
+            self._finish_game("Stalemate", None)
+
+    def _finish_game(self, reason: str, winner: str | None) -> None:
+        if self.results_summary is not None:
             return
+        if self.clock is not None:
+            self.clock.pause()
+        self.ai_thinking = False
+        result = "draw"
+        if winner is not None:
+            result = "win" if winner == self.config.human else "loss"
 
-        if is_stalemate(self.board):
-            self.status_text = "Stalemate."
-            self.end_title = "Draw"
-            self.end_reason = "Stalemate"
-            self.last_result = "draw"
-            self._finish_game("ended")
-            return
+        self.app.profile["games_played"] = int(self.app.profile.get("games_played", 0)) + 1
+        if result == "win":
+            self.app.profile["wins"] = int(self.app.profile.get("wins", 0)) + 1
+        elif result == "loss":
+            self.app.profile["losses"] = int(self.app.profile.get("losses", 0)) + 1
+        else:
+            self.app.profile["draws"] = int(self.app.profile.get("draws", 0)) + 1
+        self.app.profile["username"] = self.profile_name
+        self.app.profile["preferred_side"] = self.config.human
+        save_profile(self.app.profile)
 
-        side_name = self.user_name if self.board.side_to_move == self.human_color else self.ai_name
-        check_suffix = " (check)" if is_in_check(self.board, self.board.side_to_move) else ""
-        self.status_text = f"{side_name} to move{check_suffix}."
-
-    def _resign(self) -> None:
-        if self.game_state != "playing" or self.ai_thinking:
-            return
-        self.status_text = f"{self.user_name} resigned. {self.ai_name} wins."
-        self.end_title = "You Lost"
-        self.end_reason = "Resigned"
-        self.last_result = "ai"
-        self._finish_game("resigned")
-
-    def _start_rematch(self) -> None:
-        self._cancel_ai_search()
-        self._cancel_postgame_analysis()
-
-        self.board = Board()
-        self.move_history = []
-        self.selected_sq = None
-        self.selected_moves = []
-        self.promotion = None
-        self.last_move = None
-        self.hint_move = None
-
-        self.game_state = "playing"
-        self.game_over = False
-        self.end_title = ""
-        self.end_reason = ""
-        self.last_result = ""
-        self.popup_visible = False
-        self.popup_anim = 0.0
-        self.popup_close_rect = None
-        self.popup_rematch_rect = None
-        self.popup_continue_rect = None
-        self.popup_switch_rect = None
-        self.popup_analyze_rect = None
-        self.popup_export_rect = None
-        self.popup_analysis_prev_rect = None
-        self.popup_analysis_next_rect = None
-        self.popup_analysis_back_rect = None
-        self.rematch_choice_visible = False
-        self.analysis_mode_active = False
-        self.analysis_records = []
-        self.postgame_stats = self._empty_postgame_stats()
-        self.move_list_scroll = 0
-        self.move_list_auto_follow = True
-        self.ai_last_depth = 0
-        self.ai_last_nodes = 0
-        self.ai_last_eval_white = 0.0
-        self.ai_last_time = 0.0
-        self.editing_name = False
-        self.move_feedback_text = ""
-        self.move_feedback_until = 0.0
-        self.popup_notice = ""
-        self.popup_notice_until = 0.0
-        self.hint_explanation = ""
-        self.analysis_view_board = self.board.copy()
-        self._save_profile()
-
-        self._update_turn_status()
-
-    def _begin_game_as(self, human_color: int) -> None:
-        self.human_color = human_color
-        self.ai_color = -human_color
-        self.awaiting_start_choice = False
-        self.editing_name = False
-        self._save_profile()
-        self._update_turn_status()
-
-    def _pop_one_move(self) -> bool:
-        if not self.move_history:
-            return False
-        self.board.pop()
-        self.move_history.pop()
-        self.last_move = self.move_history[-1] if self.move_history else None
-        return True
-
-    def _undo_last_turn(self) -> None:
-        if self.ai_thinking:
-            return
-
-        undone = self._pop_one_move()
-        if self.move_history and self.board.side_to_move != self.human_color:
-            undone = self._pop_one_move() or undone
-
-        if not undone:
-            self.status_text = "No moves to undo."
-            return
-
-        self._cancel_ai_search()
-        self._clear_selection()
-        self.promotion = None
-        self.hint_move = None
-        self.move_list_auto_follow = True
-        self._reset_end_state()
-        self._update_turn_status()
-
-    def _show_hint(self) -> None:
-        if self.game_state != "playing":
-            return
-        if self.promotion is not None or not self._is_human_turn() or self.ai_thinking:
-            return
-
-        board_before = self.board.copy()
-        move, _score, _nodes, depth_used, elapsed = self._search_best_move_with_budget(
-            board_before,
-            max_depth=self.ai_depth,
-            budget_sec=min(1.2, self.ai_move_time_limit),
+        self.results_summary = GameSummary(
+            config=replace(self.config, settings=dict(self.app.settings)),
+            result=result,
+            reason=reason,
+            winner=winner,
+            move_records=list(self.move_records),
+            evals=list(self.eval_history),
+            total_time_ms=self.total_elapsed_ms,
         )
-        self.hint_move = move
-        if self.hint_move is None:
-            self.status_text = "No hint available."
-            self.hint_explanation = ""
-        else:
-            self.status_text = f"Hint: {self.hint_move.uci()}  (d{depth_used}, {elapsed:.2f}s)"
-            self.hint_explanation = self._build_hint_explanation(board_before, self.hint_move)
+        self.results_pending = True
+        self._play_sound("game_end")
 
-    def _apply_promotion(self, key: int) -> None:
-        if self.promotion is None:
-            return
-
-        wanted = None
-        if key == pygame.K_q:
-            wanted = QUEEN
-        elif key == pygame.K_r:
-            wanted = ROOK
-        elif key == pygame.K_b:
-            wanted = BISHOP
-        elif key == pygame.K_n:
-            wanted = KNIGHT
-        else:
-            return
-
-        for move in self.promotion.options:
-            if abs(move.promotion or 0) == wanted:
-                before = self.board.copy()
-                self.promotion = None
-                self._push_move(move)
-                delta = self._evaluate_move_delta(before, move, depth=1)
-                self._set_move_feedback_from_delta(delta)
-                return
-
-    def _try_make_human_move(self, from_sq: int, to_sq: int) -> None:
-        if not self._is_human_turn() or self.game_state != "playing":
-            return
-
-        moves = legal_moves_from(self.board, from_sq)
-        candidates = [m for m in moves if m.to_sq == to_sq]
-        if not candidates:
-            return
-
-        promo_moves = [m for m in candidates if m.promotion is not None]
-        if promo_moves:
-            self.promotion = PromotionChoice(from_sq, to_sq, promo_moves)
-            self.status_text = "Promotion: press Q / R / B / N."
-            return
-
-        selected_move = candidates[0]
-        before = self.board.copy()
-        self._push_move(selected_move)
-        delta = self._evaluate_move_delta(before, selected_move, depth=1)
-        self._set_move_feedback_from_delta(delta)
+    def _maybe_timeout(self, flagged: str) -> None:
+        winner = "black" if flagged == "white" else "white"
+        self._finish_game("Timeout", winner)
 
     def _start_ai_search(self) -> None:
-        if self.game_state != "playing":
+        if not self.config.has_ai or self.ai_thinking or self.results_summary is not None:
             return
-        if self.awaiting_start_choice:
+        if self.board.side_to_move != self.ai_color or self.pending_promotion is not None:
             return
-        if self.promotion is not None:
-            return
-        if self.board.side_to_move != self.ai_color:
-            return
-        if self.ai_thinking:
-            return
-
-        self.ai_task_id += 1
-        task_id = self.ai_task_id
-        board_snapshot = self.board.copy()
-        evaluator = self.evaluator
-        depth = self.ai_depth
 
         self.ai_thinking = True
-        self.ai_start_ts = time.time()
-        with self.ai_result_lock:
-            self.ai_result_payload = None
+        board_snapshot = self.board.copy()
 
         def worker() -> None:
-            move, score, nodes, best_depth, elapsed = self._search_best_move_with_budget(
-                board_snapshot=board_snapshot,
-                max_depth=depth,
-                budget_sec=self.ai_move_time_limit,
-            )
-            with self.ai_result_lock:
-                self.ai_result_payload = (task_id, move, score, nodes, elapsed, best_depth)
+            payload = search_best_move_with_budget(board_snapshot, self.config.depth, self.config.move_time, self.evaluator)
+            with self.ai_lock:
+                self.ai_result = payload
 
         self.ai_thread = threading.Thread(target=worker, daemon=True)
         self.ai_thread.start()
 
-    def _cancel_ai_search(self) -> None:
-        self.ai_task_id += 1
-        self.ai_thinking = False
-        self.ai_thread = None
-        with self.ai_result_lock:
-            self.ai_result_payload = None
-
-    def _poll_ai_result(self) -> None:
+    def _poll_ai(self) -> None:
         if not self.ai_thinking:
             return
-
-        with self.ai_result_lock:
-            payload = self.ai_result_payload
+        with self.ai_lock:
+            payload = self.ai_result
+            self.ai_result = None
         if payload is None:
             return
-
-        task_id, move, score, nodes, elapsed, depth_used = payload
-        if task_id != self.ai_task_id:
-            with self.ai_result_lock:
-                self.ai_result_payload = None
-            return
-
+        move, score, nodes, depth_used, elapsed = payload
         self.ai_thinking = False
-        self.ai_thread = None
         self.ai_last_time = elapsed
-        self.ai_last_depth = depth_used
         self.ai_last_nodes = int(nodes)
-        self.ai_last_eval_white = float(score) * float(self.ai_color)
-        with self.ai_result_lock:
-            self.ai_result_payload = None
+        self.ai_last_depth = int(depth_used)
+        self.ai_last_eval_cp = float(score) * (-100.0 if self.ai_color == BLACK else 100.0)
+        if move is not None and self.results_summary is None and self.board.side_to_move == self.ai_color:
+            self._apply_move(move, "ai")
 
-        if self.game_state != "playing":
+    def _undo(self) -> None:
+        if self.ai_thinking or not self.move_history or self.results_summary is not None:
             return
-        if self.board.side_to_move != self.ai_color:
+        plies = 1 if not self.config.has_ai else min(2, len(self.move_history))
+        for _ in range(plies):
+            self.board.pop()
+            self.move_history.pop()
+            self.move_records.pop()
+            if self.eval_history:
+                self.eval_history.pop()
+            if self.move_list.entries:
+                self.move_list.entries.pop()
+        self.move_list.current = len(self.move_list.entries) - 1
+        self.last_move = self.move_history[-1] if self.move_history else None
+        self.confirm_resign = False
+        self.hint_move = None
+        self._clear_selection()
+        self._set_status()
+        self._update_eval()
+
+    def _show_hint(self) -> None:
+        if self.ai_thinking or self.results_summary is not None or not self._is_human_turn():
             return
+        move, _score, _nodes, _depth_used, _elapsed = search_best_move_with_budget(
+            self.board.copy(),
+            min(self.config.depth, 8),
+            min(1.2, self.config.move_time),
+            self.evaluator,
+        )
         if move is None:
-            self._update_turn_status()
             return
+        self.hint_move = move
+        self.hint_explanation = self._build_hint_explanation(self.board.copy(), move)
+        self.hint_until = pygame.time.get_ticks() + 3000
+        self.hint_fade_end = self.hint_until + ANIM_FADE_MS
 
-        self._push_move(move)
-
-    def _handle_name_edit_key(self, key: int, unicode_char: str) -> None:
-        if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            cleaned = self.user_name.strip()
-            self.user_name = cleaned if cleaned else "Soprano"
-            self.editing_name = False
-            self._save_profile()
-            self._update_turn_status()
-            return
-        if key == pygame.K_ESCAPE:
-            if not self.user_name.strip():
-                self.user_name = "Soprano"
-            self.editing_name = False
-            return
-        if key == pygame.K_BACKSPACE:
-            self.user_name = self.user_name[:-1]
-            return
-        if len(self.user_name) >= 16:
-            return
-        if unicode_char and unicode_char.isprintable():
-            self.user_name += unicode_char
-
-    def _is_button_enabled(self, key: str) -> bool:
-        if key == "undo":
-            return bool(self.move_history) and not self.ai_thinking
-        if key == "hint":
-            return self.game_state == "playing" and self._is_human_turn() and self.promotion is None and not self.ai_thinking
-        if key == "resign":
-            return self.game_state == "playing" and not self.ai_thinking
+    def _attempt_move(self, from_sq: int, to_sq: int) -> bool:
+        if self.results_summary is not None or not self._is_human_turn():
+            return False
+        candidates = [move for move in legal_moves_from(self.board, from_sq) if move.to_sq == to_sq]
+        if not candidates:
+            return False
+        promos = [move for move in candidates if move.promotion is not None]
+        if promos:
+            self.pending_promotion = (from_sq, to_sq, promos)
+            self.banner_text = "Promotion: press Q, R, B, or N"
+            self.banner_until = pygame.time.get_ticks() + 1600
+            return True
+        self._apply_move(candidates[0], "human")
         return True
 
-    def _open_rematch_choice(self) -> None:
-        if not self.popup_visible or self.analysis_mode_active:
+    def _apply_promotion_key(self, key: int) -> None:
+        if self.pending_promotion is None:
             return
-        self.rematch_choice_visible = True
-        self.popup_continue_rect = None
-        self.popup_switch_rect = None
-
-    def _start_rematch_with_side_choice(self, switch_side: bool) -> None:
-        if switch_side:
-            self.human_color = -self.human_color
-            self.ai_color = -self.human_color
-        self._start_rematch()
-
-    def _handle_move_list_scroll(self, wheel_y: int) -> bool:
-        if wheel_y == 0:
-            return False
-        if not self.move_list_rect.collidepoint(pygame.mouse.get_pos()):
-            return False
-
-        total_rows = (len(self.move_history) + 1) // 2
-        content_height = max(1, self.move_list_rect.height - 50)
-        visible_rows = max(1, content_height // self.move_list_row_height)
-        max_scroll = max(0, total_rows - visible_rows)
-
-        self.move_list_scroll = max(0, min(max_scroll, self.move_list_scroll - int(wheel_y)))
-        self.move_list_auto_follow = self.move_list_scroll >= max_scroll
-        return True
-
-    def _handle_panel_click(self, pos: Tuple[int, int]) -> bool:
-        if self.user_name_input_rect.collidepoint(pos):
-            self.editing_name = True
-            return True
-
-        for key, button in self.buttons.items():
-            if not button.rect.collidepoint(pos):
-                continue
-            if not self._is_button_enabled(key):
-                return True
-            if key == "undo":
-                self._undo_last_turn()
-            elif key == "hint":
-                self._show_hint()
-            elif key == "resign":
-                self._resign()
-            return True
-        return False
-
-    def handle_event(self, event: pygame.event.Event) -> None:
-        if event.type == pygame.QUIT:
-            raise SystemExit
-
-        if event.type == pygame.MOUSEWHEEL:
-            if self._handle_move_list_scroll(event.y):
+        wanted = {pygame.K_q: QUEEN, pygame.K_r: ROOK, pygame.K_b: BISHOP, pygame.K_n: KNIGHT}.get(key)
+        if wanted is None:
+            return
+        for move in self.pending_promotion[2]:
+            if abs(move.promotion or 0) == wanted:
+                self._apply_move(move, "human")
                 return
 
-        if event.type == pygame.KEYDOWN:
-            if self.editing_name:
-                self._handle_name_edit_key(event.key, event.unicode)
-                return
-            if self.awaiting_start_choice:
-                if event.key == pygame.K_w:
-                    self._begin_game_as(WHITE)
-                    return
-                if event.key == pygame.K_b:
-                    self._begin_game_as(BLACK)
-                    return
-                return
-            if event.key == pygame.K_ESCAPE:
-                if self.popup_visible:
-                    if self.analysis_mode_active:
-                        self._leave_analysis_mode()
-                    else:
-                        self.popup_visible = False
-                        self.rematch_choice_visible = False
-                        self.popup_continue_rect = None
-                        self.popup_switch_rect = None
-                self.promotion = None
-                self.hint_move = None
+    def _illegal_feedback(self) -> None:
+        duration = self._animation_duration(ANIM_SHAKE_MS)
+        if duration:
+            self.animation.add_shake(duration)
+        self.banner_text = "Illegal move"
+        self.banner_until = pygame.time.get_ticks() + 900
+        self._play_sound("illegal")
+
+    def _handle_board_down(self, pos: tuple[int, int]) -> None:
+        square = self._square_from_mouse(pos)
+        if square is None or not self._is_human_turn():
+            return
+        piece = self.board.piece_at(square)
+        if piece and piece_color(piece) == self.board.side_to_move:
+            self.drag_sq = square
+            self.drag_piece = piece
+            self.drag_origin = pos
+            self.drag_pos = pos
+            self.dragging = False
+            self._select_square(square)
+        elif self.selected_sq is not None:
+            if not self._attempt_move(self.selected_sq, square):
                 self._clear_selection()
-                return
-            if self.popup_visible and self.analysis_mode_active:
-                if event.key == pygame.K_LEFT:
-                    self._set_analysis_index(self.analysis_view_index - 1)
-                    return
-                if event.key == pygame.K_RIGHT:
-                    self._set_analysis_index(self.analysis_view_index + 1)
-                    return
-                if event.key == pygame.K_r:
-                    return
-                if event.key in (pygame.K_a, pygame.K_TAB):
-                    self._leave_analysis_mode()
-                    return
-            if self.popup_visible and event.key == pygame.K_r:
-                if self.rematch_choice_visible:
-                    self._start_rematch_with_side_choice(False)
+                self._illegal_feedback()
+
+    def _handle_board_up(self, pos: tuple[int, int]) -> None:
+        if self.drag_sq is None:
+            return
+        target = self._square_from_mouse(pos)
+        from_sq = self.drag_sq
+        was_dragging = self.dragging
+        self.drag_sq = None
+        self.drag_piece = None
+        self.drag_origin = None
+        self.drag_pos = None
+        self.dragging = False
+        if target is None:
+            return
+        if was_dragging or target != from_sq:
+            success = self._attempt_move(from_sq, target)
+            if not success and target != from_sq:
+                if self.board.piece_at(target) and piece_color(self.board.piece_at(target)) == self.board.side_to_move:
+                    self._select_square(target)
                 else:
-                    self._open_rematch_choice()
-                return
-            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.popup_visible:
-                if self.rematch_choice_visible:
-                    self._start_rematch_with_side_choice(False)
-                else:
-                    self.popup_visible = False
-                    self.rematch_choice_visible = False
-                    self.popup_continue_rect = None
-                    self.popup_switch_rect = None
-                return
-            self._apply_promotion(event.key)
-            return
+                    self._illegal_feedback()
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button in (4, 5):
-            wheel_y = 1 if event.button == 4 else -1
-            if self._handle_move_list_scroll(wheel_y):
-                return
+    def _handle_buttons(self, event: pygame.event.Event) -> None:
+        for button, action in (
+            (self.undo_button, self._undo),
+            (self.hint_button, self._show_hint),
+            (self.resign_button, lambda: setattr(self, "confirm_resign", True)),
+        ):
+            if button.handle_event(event) == "clicked" and not button.disabled:
+                action()
 
-        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
-            return
+    def update(self, events: list[pygame.event.Event], dt_ms: int):
+        if self.results_ready and self.results_summary is not None:
+            self.results_summary.background = self.screen.copy()
+            self.app.last_summary = self.results_summary
+            from gui.screens.results import ResultsScreen
 
-        pos = event.pos
-        if self.awaiting_start_choice:
-            if self.setup_name_input_rect.collidepoint(pos):
-                self.editing_name = True
-                return
-            self.editing_name = False
-            if self.setup_white_rect.collidepoint(pos):
-                self._begin_game_as(WHITE)
-                return
-            if self.setup_black_rect.collidepoint(pos):
-                self._begin_game_as(BLACK)
-                return
-            return
+            return ResultsScreen(self.screen, self.app, self.results_summary)
 
-        if self.popup_visible:
-            if self.analysis_mode_active:
-                if self.popup_analysis_prev_rect is not None and self.popup_analysis_prev_rect.collidepoint(pos):
-                    self._set_analysis_index(self.analysis_view_index - 1)
-                    return
-                if self.popup_analysis_next_rect is not None and self.popup_analysis_next_rect.collidepoint(pos):
-                    self._set_analysis_index(self.analysis_view_index + 1)
-                    return
-                if self.popup_analysis_back_rect is not None and self.popup_analysis_back_rect.collidepoint(pos):
-                    self._leave_analysis_mode()
-                    return
-            else:
-                if self.rematch_choice_visible:
-                    if self.popup_continue_rect is not None and self.popup_continue_rect.collidepoint(pos):
-                        self._start_rematch_with_side_choice(False)
-                        return
-                    if self.popup_switch_rect is not None and self.popup_switch_rect.collidepoint(pos):
-                        self._start_rematch_with_side_choice(True)
-                        return
-                else:
-                    if self.popup_analyze_rect is not None and self.popup_analyze_rect.collidepoint(pos):
-                        self._enter_analysis_mode()
-                        return
-                    if self.popup_export_rect is not None and self.popup_export_rect.collidepoint(pos):
-                        out_path = self._export_game_pgn()
-                        if out_path is None:
-                            self._set_popup_notice("PGN export failed.")
-                        else:
-                            self._set_popup_notice(f"Exported: {out_path.name}")
-                        return
-                    if self.popup_rematch_rect is not None and self.popup_rematch_rect.collidepoint(pos):
-                        self._open_rematch_choice()
-                        return
-            if self.popup_close_rect is not None and self.popup_close_rect.collidepoint(pos):
-                self.popup_visible = False
-                self.rematch_choice_visible = False
-                self.popup_continue_rect = None
-                self.popup_switch_rect = None
-                self._leave_analysis_mode()
-                return
-            return
-        if self._handle_panel_click(pos):
-            return
+        self.total_elapsed_ms += dt_ms
+        self.animation.update(dt_ms)
+        self.eval_bar.update(dt_ms)
+        if self.hidden_anim_to_sq is not None and not self.animation.is_animating_move():
+            self.hidden_anim_to_sq = None
+        if self.clock is not None and self.results_summary is None:
+            flagged = self.clock.update(dt_ms)
+            if flagged is not None:
+                self._maybe_timeout(flagged)
 
-        if self.editing_name:
-            self.editing_name = False
-        if self.game_state != "playing":
-            return
-        if self.promotion is not None or not self._is_human_turn() or self.ai_thinking:
-            return
+        self.undo_button.disabled = self.ai_thinking or not self.move_history
+        self.hint_button.disabled = self.ai_thinking or not self._is_human_turn() or self.results_summary is not None
+        self.resign_button.disabled = self.ai_thinking or self.results_summary is not None
 
-        sq = self._square_from_mouse(pos)
-        if sq is None:
-            return
+        self._poll_ai()
+        if self.results_summary is None and not self.ai_thinking:
+            self._start_ai_search()
 
-        if self.selected_sq is None:
-            piece = self.board.piece_at(sq)
-            if piece != EMPTY and piece_color(piece) == self.human_color:
-                self.selected_sq = sq
-                self.selected_moves = legal_moves_from(self.board, sq)
-            return
+        for event in events:
+            if self.confirm_resign:
+                dialog = pygame.Rect(0, 0, 320, 160)
+                dialog.center = (640, 400)
+                self.confirm_yes.rect = pygame.Rect(dialog.x + 38, dialog.bottom - 56, 110, 40)
+                self.confirm_no.rect = pygame.Rect(dialog.right - 148, dialog.bottom - 56, 110, 40)
+                if self.confirm_yes.handle_event(event) == "clicked":
+                    self.confirm_resign = False
+                    winner = "black" if self.config.human == "white" else "white"
+                    self._finish_game("Resignation", winner)
+                if self.confirm_no.handle_event(event) == "clicked":
+                    self.confirm_resign = False
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    self.confirm_resign = False
+                continue
 
-        if sq == self.selected_sq:
-            self._clear_selection()
-            return
+            if self.move_list.handle_event(event) is not None:
+                continue
+            self._handle_buttons(event)
 
-        self._try_make_human_move(self.selected_sq, sq)
-        if self.board.side_to_move == self.human_color and self.game_state == "playing":
-            piece = self.board.piece_at(sq)
-            if piece != EMPTY and piece_color(piece) == self.human_color:
-                self.selected_sq = sq
-                self.selected_moves = legal_moves_from(self.board, sq)
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self._clear_selection()
+                    self.pending_promotion = None
+                if event.key in (pygame.K_q, pygame.K_r, pygame.K_b, pygame.K_n):
+                    self._apply_promotion_key(event.key)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.stats_rect.collidepoint(event.pos):
+                    self.ai_stats_expanded = not self.ai_stats_expanded
+                elif self.board_rect.inflate(18, 18).move(self.animation.get_shake_offset_x(), 0).collidepoint(event.pos):
+                    self._handle_board_down(event.pos)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self._handle_board_up(event.pos)
+            elif event.type == pygame.MOUSEMOTION and self.drag_sq is not None:
+                self.drag_pos = event.pos
+                if self.drag_origin and (abs(event.pos[0] - self.drag_origin[0]) > 4 or abs(event.pos[1] - self.drag_origin[1]) > 4):
+                    self.dragging = True
 
-    def _draw_board(self) -> None:
-        pygame.draw.rect(self.screen, BOARD_BORDER, self.board_rect.inflate(10, 10), border_radius=8)
+        return self
+
+    def _draw_board(self, surface: pygame.Surface) -> None:
+        skin = theme.get_skin()
+        shake = self.animation.get_shake_offset_x()
+        container = self.board_rect.inflate(18, 18).move(shake, 0)
+        pygame.draw.rect(surface, BG_SURFACE, container, border_radius=18)
+        pygame.draw.rect(surface, (0, 0, 0), container.inflate(-4, -4), width=2, border_radius=16)
+
         for row in range(8):
             for col in range(8):
-                color = LIGHT_SQUARE if (row + col) % 2 == 0 else DARK_SQUARE
-                rect = pygame.Rect(self.board_rect.x + col * self.square_size, self.board_rect.y + row * self.square_size, self.square_size, self.square_size)
-                pygame.draw.rect(self.screen, color, rect)
+                display_row, display_col = self._board_to_display(row, col)
+                rect = pygame.Rect(
+                    self.board_rect.x + shake + display_col * SQUARE_SIZE,
+                    self.board_rect.y + display_row * SQUARE_SIZE,
+                    SQUARE_SIZE,
+                    SQUARE_SIZE,
+                )
+                color = skin["light"] if (row + col) % 2 == 0 else skin["dark"]
+                pygame.draw.rect(surface, color, rect)
 
-    def _draw_last_move(self) -> None:
-        move_to_draw: Optional[Move] = self.last_move
-        if self.popup_visible and self.analysis_mode_active:
-            if self.analysis_view_index <= 0:
-                move_to_draw = None
-            elif self.analysis_view_index - 1 < len(self.move_history):
-                move_to_draw = self.move_history[self.analysis_view_index - 1]
-        if move_to_draw is None:
-            return
-        self._draw_square_overlay(move_to_draw.from_sq, LAST_MOVE_FROM)
-        self._draw_square_overlay(move_to_draw.to_sq, LAST_MOVE_TO)
+        if self.last_move is not None:
+            for square in (self.last_move.from_sq, self.last_move.to_sq):
+                overlay = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
+                overlay.fill((*ACCENT, 80))
+                surface.blit(overlay, self._square_rect(square, True).topleft)
 
-    def _draw_pieces(self) -> None:
-        board_view = self._render_board()
+        if self.selected_sq is not None:
+            rect = self._square_rect(self.selected_sq, True)
+            overlay = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
+            overlay.fill((*ACCENT, 140))
+            surface.blit(overlay, rect.topleft)
+            pygame.draw.rect(surface, ACCENT, rect, width=3, border_radius=8)
+
+        if self.config.settings.get("show_legal_moves", True):
+            for move in self.selected_moves:
+                rect = self._square_rect(move.to_sq, True)
+                target = self.board.piece_at(move.to_sq)
+                if target or move.is_en_passant:
+                    pygame.draw.circle(surface, GOLD, rect.center, 18, width=4)
+                else:
+                    dot = pygame.Surface((20, 20), pygame.SRCALPHA)
+                    pygame.draw.circle(dot, (255, 255, 255, 80), (10, 10), 10)
+                    surface.blit(dot, dot.get_rect(center=rect.center))
+
+        self.animation.draw_check_pulse(surface, SQUARE_SIZE)
+        self.animation.draw_moving_pieces(surface)
+
         for row in range(8):
             for col in range(8):
-                piece = int(board_view.squares[row, col])
-                if piece == EMPTY:
-                    continue
-                image = self.piece_images.get(piece)
-                if image is None:
+                piece = int(self.board.squares[row, col])
+                if piece == 0:
                     continue
                 square = row * 8 + col
-                self.screen.blit(image, image.get_rect(center=self._square_rect(square).center))
+                if self.hidden_anim_to_sq == square:
+                    continue
+                if self.dragging and self.drag_sq == square:
+                    continue
+                image = self.piece_images[piece]
+                surface.blit(image, image.get_rect(center=self._square_rect(square, True).center))
 
-    def _draw_selected_square(self) -> None:
-        if self.selected_sq is None or (self.popup_visible and self.analysis_mode_active):
-            return
-        pygame.draw.rect(self.screen, SELECTED_BORDER, self._square_rect(self.selected_sq), width=4)
+        if self.dragging and self.drag_piece is not None and self.drag_pos is not None:
+            image = self.piece_images[self.drag_piece]
+            surface.blit(image, image.get_rect(center=self.drag_pos))
 
-    def _draw_legal_move_hints(self) -> None:
-        if self.popup_visible and self.analysis_mode_active:
-            return
-        board_view = self._render_board()
-        for move in self.selected_moves:
-            rect = self._square_rect(move.to_sq)
-            target = board_view.piece_at(move.to_sq)
-            color = LEGAL_CAPTURE_DOT if (target != EMPTY or move.is_en_passant) else LEGAL_MOVE_DOT
-            pygame.draw.circle(self.screen, color, rect.center, self.square_size // 10)
-
-    def _draw_hint_arrow(self) -> None:
-        if self.hint_move is None or self.game_state != "playing" or (self.popup_visible and self.analysis_mode_active):
-            return
-
-        sx, sy = self._square_center(self.hint_move.from_sq)
-        ex, ey = self._square_center(self.hint_move.to_sq)
-        dx = ex - sx
-        dy = ey - sy
-        dist = math.hypot(dx, dy)
-        if dist < 1.0:
-            return
-
-        ux = dx / dist
-        uy = dy / dist
-        start_pad = self.square_size * 0.18
-        end_pad = self.square_size * 0.22
-        line_start = (sx + ux * start_pad, sy + uy * start_pad)
-        line_end = (ex - ux * end_pad, ey - uy * end_pad)
-
-        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        pygame.draw.line(overlay, HINT_ARROW_COLOR, (int(line_start[0]), int(line_start[1])), (int(line_end[0]), int(line_end[1])), 12)
-
-        head_len = 24
-        head_w = 16
-        tip = (line_end[0], line_end[1])
-        left = (tip[0] - ux * head_len + uy * head_w * 0.5, tip[1] - uy * head_len - ux * head_w * 0.5)
-        right = (tip[0] - ux * head_len - uy * head_w * 0.5, tip[1] - uy * head_len + ux * head_w * 0.5)
-        pygame.draw.polygon(overlay, HINT_ARROW_COLOR, [(int(tip[0]), int(tip[1])), (int(left[0]), int(left[1])), (int(right[0]), int(right[1]))])
-        self.screen.blit(overlay, (0, 0))
-
-    def _draw_coordinates(self) -> None:
-        if self._is_board_flipped():
-            files = "hgfedcba"
-            ranks = [str(row + 1) for row in range(8)]
-        else:
-            files = "abcdefgh"
-            ranks = [str(8 - row) for row in range(8)]
-
+        files = "hgfedcba" if self._board_flipped() else "abcdefgh"
+        ranks = [str(index + 1) for index in range(8)] if self._board_flipped() else [str(8 - index) for index in range(8)]
         for col in range(8):
-            label = self.font_board.render(files[col], True, (226, 238, 245))
-            self.screen.blit(label, (self.board_rect.x + col * self.square_size + self.square_size - 14, self.board_rect.bottom - 18))
-
+            label = self.small_font.render(files[col], True, MUTED)
+            surface.blit(label, (self.board_rect.x + shake + col * SQUARE_SIZE + SQUARE_SIZE - 16, self.board_rect.bottom - 20))
         for row in range(8):
-            label = self.font_board.render(ranks[row], True, (226, 238, 245))
-            self.screen.blit(label, (self.board_rect.x + 6, self.board_rect.y + row * self.square_size + 6))
+            label = self.small_font.render(ranks[row], True, MUTED)
+            surface.blit(label, (self.board_rect.x + shake + 6, self.board_rect.y + row * SQUARE_SIZE + 6))
 
-    def _draw_player_cards(self) -> None:
-        pygame.draw.rect(self.screen, CARD_BG, self.ai_panel_rect, border_radius=10)
-        pygame.draw.rect(self.screen, CARD_BG, self.user_panel_rect, border_radius=10)
+    def _draw_sidebars(self, surface: pygame.Surface) -> None:
+        pygame.draw.rect(surface, BG_CARD, self.left_rect)
+        pygame.draw.rect(surface, BG_CARD, self.right_rect)
 
-        ai_avatar_y = self.ai_panel_rect.y + (self.ai_panel_rect.height - self.cortex_avatar.get_height()) // 2
-        self.screen.blit(self.cortex_avatar, (self.ai_panel_rect.x + 8, ai_avatar_y))
+        opp_turn = (self.board.side_to_move == (BLACK if self.config.human == "white" else WHITE)) if self.config.has_ai else (self.board.side_to_move != self.human_color)
+        self.opp_card.active = opp_turn
+        self.player_card.active = not opp_turn
+        self.opp_card.draw(surface)
+        self.player_card.draw(surface)
 
-        ai_label = self.font_player.render(self.ai_name, True, TEXT_PRIMARY)
-        ai_label_y = self.ai_panel_rect.y + (self.ai_panel_rect.height - ai_label.get_height()) // 2
-        self.screen.blit(ai_label, (self.ai_panel_rect.x + 56, ai_label_y))
+        if self.config.settings.get("show_eval_bar", True):
+            self.eval_bar.draw(surface)
+        if self.clock is not None:
+            top_clock = pygame.Rect(18, 486, 144, 54)
+            bottom_clock = pygame.Rect(18, 554, 144, 54)
+            self.clock.draw(surface, top_clock, "white" if self.config.human == "black" else "black")
+            self.clock.draw(surface, bottom_clock, self.config.human)
 
-        if self.ai_thinking and self.game_state == "playing":
-            dots = "." * ((int(time.time() * 3) % 3) + 1)
-            thinking = self.font_small.render(f"Thinking{dots}", True, ACCENT)
-            self.screen.blit(
-                thinking,
-                (
-                    self.ai_panel_rect.right - thinking.get_width() - 14,
-                    self.ai_panel_rect.y + (self.ai_panel_rect.height - thinking.get_height()) // 2,
-                ),
-            )
-        else:
-            ready = self.font_small.render("Ready", True, TEXT_MUTED)
-            self.screen.blit(
-                ready,
-                (
-                    self.ai_panel_rect.right - ready.get_width() - 14,
-                    self.ai_panel_rect.y + (self.ai_panel_rect.height - ready.get_height()) // 2,
-                ),
-            )
-
-        user_avatar = self._get_user_avatar(40)
-        user_avatar_y = self.user_panel_rect.y + (self.user_panel_rect.height - user_avatar.get_height()) // 2
-        self.screen.blit(user_avatar, (self.user_panel_rect.x + 8, user_avatar_y))
-        pygame.draw.rect(self.screen, (14, 58, 82), self.user_name_input_rect, border_radius=7)
-        pygame.draw.rect(self.screen, ACCENT if self.editing_name else (64, 115, 141), self.user_name_input_rect, width=2, border_radius=7)
-
-        display_name = self.user_name if self.user_name else "Soprano"
-        caret = "|" if self.editing_name and int(time.time() * 2) % 2 == 0 else ""
-        label = self.font_player.render(display_name + (caret if self.editing_name else ""), True, TEXT_PRIMARY)
-        self.screen.blit(
-            label,
-            (
-                self.user_name_input_rect.x + 8,
-                self.user_name_input_rect.y + (self.user_name_input_rect.height - label.get_height()) // 2,
-            ),
-        )
-
-    def _draw_button(self, button: UIButton, enabled: bool) -> None:
-        mouse = pygame.mouse.get_pos()
-        hover = button.rect.collidepoint(mouse)
-        if not enabled:
-            bg = BUTTON_BG_DISABLED
-            fg = (142, 161, 172)
-        elif hover:
-            bg = BUTTON_BG_HOVER
-            fg = (248, 252, 255)
-        else:
-            bg = BUTTON_BG
-            fg = (236, 245, 250)
-
-        pygame.draw.rect(self.screen, bg, button.rect, border_radius=12)
-        pygame.draw.rect(self.screen, (31, 96, 124), button.rect, width=2, border_radius=12)
-        text = self.font_button.render(button.label, True, fg)
-        self.screen.blit(text, text.get_rect(center=button.rect.center))
-
-    def _draw_move_list(self, rect: pygame.Rect) -> None:
-        pygame.draw.rect(self.screen, (8, 42, 60, 170), rect, border_radius=10)
-        pygame.draw.rect(self.screen, (36, 88, 112), rect, width=1, border_radius=10)
-
-        self.screen.blit(self.font_body.render("Move List", True, TEXT_PRIMARY), (rect.x + 12, rect.y + 10))
-
-        rows = []
-        for i in range(0, len(self.move_history), 2):
-            move_no = i // 2 + 1
-            white_move = self.move_history[i].uci()
-            black_move = self.move_history[i + 1].uci() if i + 1 < len(self.move_history) else ""
-            rows.append((move_no, white_move, black_move))
-
-        content_rect = pygame.Rect(rect.x + 10, rect.y + 42, rect.width - 20, rect.height - 50)
-        visible_rows = max(1, content_rect.height // self.move_list_row_height)
-        max_scroll = max(0, len(rows) - visible_rows)
-        if self.move_list_auto_follow:
-            self.move_list_scroll = max_scroll
-        else:
-            self.move_list_scroll = max(0, min(self.move_list_scroll, max_scroll))
-
-        start = self.move_list_scroll
-        end = min(len(rows), start + visible_rows)
-        clip_prev = self.screen.get_clip()
-        self.screen.set_clip(content_rect)
-        y = content_rect.y + 2
-        for row_index in range(start, end):
-            move_no, white_move, black_move = rows[row_index]
-            text = self.font_small.render(f"{move_no:>2}. {white_move:<7} {black_move:<7}", True, TEXT_MUTED)
-            self.screen.blit(text, (content_rect.x + 2, y))
-            y += self.move_list_row_height
-        self.screen.set_clip(clip_prev)
-
-    def _draw_sidebar(self) -> None:
-        pygame.draw.rect(self.screen, PANEL_BG, self.right_panel_rect, border_radius=14)
-        pygame.draw.rect(self.screen, (30, 92, 120), self.right_panel_rect, width=2, border_radius=14)
-
-        self.screen.blit(self.font_panel_title.render("Cortex64", True, TEXT_PRIMARY), (self.right_panel_rect.x + 20, self.right_panel_rect.y + 16))
-        subtitle = self.font_small.render(f"Single Player vs AI  |  Eval: {self.eval_label}", True, TEXT_MUTED)
-        self.screen.blit(subtitle, (self.right_panel_rect.x + 22, self.right_panel_rect.y + 52))
-
-        score_rect = pygame.Rect(self.right_panel_rect.x + 20, self.right_panel_rect.y + 84, self.right_panel_rect.width - 40, 76)
-        pygame.draw.rect(self.screen, (10, 50, 70, 185), score_rect, border_radius=10)
-        score_title = self.font_small.render(f"Games this run: {self.session_games}", True, TEXT_PRIMARY)
-        score_line = self.font_small.render(
-            f"{self.user_name}: {self.session_user_wins}  {self.ai_name}: {self.session_ai_wins}  Draw: {self.session_draws}",
+        score = self.title_font.render("CORTEX64", True, ACCENT)
+        surface.blit(score, (888, 32))
+        surface.blit(self.body_font.render("⬡ Engine HUD", True, MUTED), (890, 66))
+        profile_line = self.small_font.render(
+            f"W/L/D {self.app.profile.get('wins', 0)}/{self.app.profile.get('losses', 0)}/{self.app.profile.get('draws', 0)}",
             True,
-            TEXT_MUTED,
+            MUTED,
         )
-        total_line = self.font_small.render(
-            f"Total W/L/D: {self.total_wins}/{self.total_losses}/{self.total_draws}",
-            True,
-            TEXT_MUTED,
-        )
-        self.screen.blit(score_title, (score_rect.x + 10, score_rect.y + 8))
-        self.screen.blit(score_line, (score_rect.x + 10, score_rect.y + 30))
-        self.screen.blit(total_line, (score_rect.x + 10, score_rect.y + 50))
+        surface.blit(profile_line, (890, 92))
+        surface.blit(self.title_font.render("Moves", True, WHITE_COL), (888, 104))
+        self.move_list.draw(surface)
 
-        status_rect = pygame.Rect(self.right_panel_rect.x + 20, self.right_panel_rect.y + 168, self.right_panel_rect.width - 40, 52)
-        pygame.draw.rect(self.screen, (10, 50, 70, 185), status_rect, border_radius=10)
-        status = self.font_body.render(self.status_text, True, TEXT_PRIMARY)
-        self.screen.blit(status, (status_rect.x + 10, status_rect.y + 14))
+        pygame.draw.rect(surface, BG_SURFACE, self.stats_rect, border_radius=14)
+        pygame.draw.rect(surface, ACCENT if self.ai_stats_expanded else MUTED, self.stats_rect, width=1, border_radius=14)
+        collapsed = f"AI: depth {self.ai_last_depth} · {self.ai_last_eval_cp/100:+.1f} · {self.ai_last_time:.1f}s"
+        if not self.config.has_ai:
+            collapsed = f"Local: {len(self.move_history)} plies · {self.status_text}"
+        surface.blit(self.body_font.render(collapsed, True, WHITE_COL), (self.stats_rect.x + 12, self.stats_rect.y + 12))
+        if self.ai_stats_expanded:
+            items = [
+                ("Depth", str(self.ai_last_depth)),
+                ("Nodes", str(self.ai_last_nodes)),
+                ("Eval", f"{self.ai_last_eval_cp/100:+.2f}"),
+                ("Time", f"{self.ai_last_time:.2f}s"),
+            ]
+            for idx, (label, value) in enumerate(items):
+                x = self.stats_rect.x + 12 + (idx % 2) * 170
+                y = self.stats_rect.y + 42 + (idx // 2) * 24
+                surface.blit(self.small_font.render(f"{label}: {value}", True, WHITE_COL if idx % 2 == 0 else MUTED), (x, y))
 
-        if self.ai_thinking and self.game_state == "playing":
-            info = self.font_small.render(f"{self.ai_name} search: {time.time() - self.ai_start_ts:.1f}s", True, ACCENT)
-        else:
-            info = self.font_small.render(f"Last AI move: {self.ai_last_time:.2f}s  d{self.ai_last_depth}", True, TEXT_MUTED)
-        self.screen.blit(info, (self.right_panel_rect.x + 22, self.right_panel_rect.y + 228))
+        toast_rect = pygame.Rect(888, 646, 364, 32)
+        pygame.draw.rect(surface, BG_SURFACE, toast_rect, border_radius=10)
+        text = self.hint_explanation if self.hint_move and pygame.time.get_ticks() < self.hint_fade_end else self.status_text
+        color = GOLD if self.hint_move and pygame.time.get_ticks() < self.hint_fade_end else WHITE_COL
+        surface.blit(self.small_font.render(fit_text(self.small_font, text, 344), True, color), (toast_rect.x + 10, toast_rect.y + 8))
 
-        stats_rect = pygame.Rect(self.right_panel_rect.x + 20, self.right_panel_rect.y + 252, self.right_panel_rect.width - 40, 74)
-        pygame.draw.rect(self.screen, (10, 50, 70, 185), stats_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (36, 88, 112), stats_rect, width=1, border_radius=10)
-        depth_txt = self.font_small.render(f"Depth: {self.ai_last_depth}    Nodes: {self.ai_last_nodes}", True, TEXT_PRIMARY)
-        time_txt = self.font_small.render(f"Time: {self.ai_last_time:.2f}s", True, TEXT_MUTED)
-        eval_txt = self.font_small.render(f"Eval (White): {self.ai_last_eval_white:+.2f}", True, TEXT_MUTED)
-        self.screen.blit(depth_txt, (stats_rect.x + 10, stats_rect.y + 8))
-        self.screen.blit(time_txt, (stats_rect.x + 10, stats_rect.y + 30))
-        self.screen.blit(eval_txt, (stats_rect.x + 130, stats_rect.y + 30))
+        self.undo_button.draw(surface)
+        self.hint_button.draw(surface)
+        self.resign_button.draw(surface)
 
-        bar_rect = pygame.Rect(stats_rect.x + 10, stats_rect.y + 52, stats_rect.width - 20, 10)
-        pygame.draw.rect(self.screen, (27, 68, 90), bar_rect, border_radius=5)
-        center_x = bar_rect.x + bar_rect.width // 2
-        pygame.draw.line(self.screen, (96, 142, 166), (center_x, bar_rect.y), (center_x, bar_rect.bottom), 1)
-        clamped_eval = max(-3.0, min(3.0, self.ai_last_eval_white))
-        fill = int((clamped_eval / 3.0) * (bar_rect.width // 2))
-        if fill >= 0:
-            fill_rect = pygame.Rect(center_x, bar_rect.y, fill, bar_rect.height)
-            fill_color = (120, 204, 132)
-        else:
-            fill_rect = pygame.Rect(center_x + fill, bar_rect.y, -fill, bar_rect.height)
-            fill_color = (214, 124, 110)
-        pygame.draw.rect(self.screen, fill_color, fill_rect, border_radius=5)
-
-        coach_rect = pygame.Rect(self.right_panel_rect.x + 20, self.right_panel_rect.y + 332, self.right_panel_rect.width - 40, 30)
-        pygame.draw.rect(self.screen, (10, 45, 64, 175), coach_rect, border_radius=8)
-        coach_text = ""
-        coach_color = TEXT_MUTED
-        if time.time() < self.move_feedback_until:
-            coach_text = self.move_feedback_text
-            coach_color = self.move_feedback_color
-        elif self.hint_explanation:
-            coach_text = self.hint_explanation
-            coach_color = ACCENT
-        if coach_text:
-            trimmed = coach_text
-            while self.font_small.size(trimmed)[0] > coach_rect.width - 14 and len(trimmed) > 4:
-                trimmed = trimmed[:-4] + "..."
-            coach_surf = self.font_small.render(trimmed, True, coach_color)
-            self.screen.blit(coach_surf, (coach_rect.x + 8, coach_rect.y + 6))
-
-        self.move_list_rect = self._recalculate_move_list_rect()
-        self._draw_move_list(self.move_list_rect)
-        for key, button in self.buttons.items():
-            self._draw_button(button, self._is_button_enabled(key))
-
-    def _draw_postgame_popup(self) -> None:
-        if not self.popup_visible:
-            self.popup_close_rect = None
-            self.popup_rematch_rect = None
-            self.popup_continue_rect = None
-            self.popup_switch_rect = None
-            self.popup_analyze_rect = None
-            self.popup_export_rect = None
-            self.popup_analysis_prev_rect = None
-            self.popup_analysis_next_rect = None
-            self.popup_analysis_back_rect = None
+    def _draw_hint(self, surface: pygame.Surface) -> None:
+        if self.hint_move is None:
             return
-
-        self.popup_anim = min(1.0, self.popup_anim + 0.08)
-        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 130))
-        self.screen.blit(overlay, (0, 0))
-
-        scale = 0.92 + 0.08 * self.popup_anim
-        popup_rect = pygame.Rect(0, 0, int(540 * scale), int(392 * scale))
-        popup_rect.center = (WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)
-        popup_notice_y = popup_rect.bottom - 84
-
-        panel = pygame.Surface((popup_rect.width, popup_rect.height), pygame.SRCALPHA)
-        pygame.draw.rect(panel, (10, 40, 56, 236), panel.get_rect(), border_radius=14)
-        pygame.draw.rect(panel, (65, 140, 172, 220), panel.get_rect(), width=2, border_radius=14)
-        self.screen.blit(panel, popup_rect.topleft)
-
-        if self.analysis_mode_active:
-            self.popup_rematch_rect = None
-            self.popup_continue_rect = None
-            self.popup_switch_rect = None
-            self.popup_analyze_rect = None
-            self.popup_export_rect = None
-
-            self.screen.blit(self.font_title.render("Game Analysis", True, TEXT_PRIMARY), (popup_rect.x + 24, popup_rect.y + 20))
-            self.screen.blit(
-                self.font_small.render("Use Left/Right keys or buttons to step through moves.", True, TEXT_MUTED),
-                (popup_rect.x + 26, popup_rect.y + 68),
-            )
-
-            total = len(self.move_history)
-            idx = self.analysis_view_index
-            self.screen.blit(
-                self.font_body.render(f"Ply: {idx}/{total}", True, TEXT_PRIMARY),
-                (popup_rect.x + 26, popup_rect.y + 102),
-            )
-
-            if self.analysis_in_progress and not self.analysis_records:
-                self.screen.blit(
-                    self.font_body.render("Preparing analysis...", True, ACCENT),
-                    (popup_rect.x + 26, popup_rect.y + 144),
-                )
-                self.screen.blit(
-                    self.font_small.render("Records will appear automatically.", True, TEXT_MUTED),
-                    (popup_rect.x + 26, popup_rect.y + 176),
-                )
-            else:
-                record: Optional[Dict[str, object]] = None
-                if idx > 0 and idx - 1 < len(self.analysis_records):
-                    record = self.analysis_records[idx - 1]
-                if record is None:
-                    self.screen.blit(
-                        self.font_small.render("At game start position.", True, TEXT_MUTED),
-                        (popup_rect.x + 26, popup_rect.y + 144),
-                    )
-                else:
-                    played = str(record.get("played", "-"))
-                    best = str(record.get("best", "-"))
-                    side = str(record.get("side", ""))
-                    swing = float(record.get("eval_swing_white", 0.0))
-                    quality = str(record.get("quality", "normal")).capitalize()
-                    self.screen.blit(self.font_body.render(f"{side} played: {played}", True, TEXT_PRIMARY), (popup_rect.x + 26, popup_rect.y + 140))
-                    self.screen.blit(self.font_body.render(f"Best alternative: {best}", True, TEXT_PRIMARY), (popup_rect.x + 26, popup_rect.y + 174))
-                    self.screen.blit(self.font_body.render(f"Eval swing (White): {swing:+.2f}", True, TEXT_PRIMARY), (popup_rect.x + 26, popup_rect.y + 208))
-                    self.screen.blit(self.font_small.render(f"Move quality: {quality}", True, TEXT_MUTED), (popup_rect.x + 26, popup_rect.y + 242))
-
-            button_y = popup_rect.bottom - 22
-            self.popup_analysis_prev_rect = pygame.Rect(0, 0, 128, 42)
-            self.popup_analysis_prev_rect.midbottom = (popup_rect.centerx - 132, button_y)
-            pygame.draw.rect(self.screen, BUTTON_BG, self.popup_analysis_prev_rect, border_radius=10)
-            pygame.draw.rect(self.screen, (54, 134, 170), self.popup_analysis_prev_rect, width=2, border_radius=10)
-            self.screen.blit(self.font_button.render("Prev", True, TEXT_PRIMARY), self.font_button.render("Prev", True, TEXT_PRIMARY).get_rect(center=self.popup_analysis_prev_rect.center))
-
-            self.popup_analysis_next_rect = pygame.Rect(0, 0, 128, 42)
-            self.popup_analysis_next_rect.midbottom = (popup_rect.centerx, button_y)
-            pygame.draw.rect(self.screen, BUTTON_BG_HOVER, self.popup_analysis_next_rect, border_radius=10)
-            pygame.draw.rect(self.screen, (54, 164, 170), self.popup_analysis_next_rect, width=2, border_radius=10)
-            self.screen.blit(self.font_button.render("Next", True, TEXT_PRIMARY), self.font_button.render("Next", True, TEXT_PRIMARY).get_rect(center=self.popup_analysis_next_rect.center))
-
-            self.popup_analysis_back_rect = pygame.Rect(0, 0, 128, 42)
-            self.popup_analysis_back_rect.midbottom = (popup_rect.centerx + 132, button_y)
-            pygame.draw.rect(self.screen, BUTTON_BG, self.popup_analysis_back_rect, border_radius=10)
-            pygame.draw.rect(self.screen, (54, 134, 170), self.popup_analysis_back_rect, width=2, border_radius=10)
-            self.screen.blit(self.font_button.render("Back", True, TEXT_PRIMARY), self.font_button.render("Back", True, TEXT_PRIMARY).get_rect(center=self.popup_analysis_back_rect.center))
-
-            self.popup_close_rect = pygame.Rect(0, 0, 94, 34)
-            self.popup_close_rect.topright = (popup_rect.right - 16, popup_rect.y + 16)
-            pygame.draw.rect(self.screen, BUTTON_BG, self.popup_close_rect, border_radius=8)
-            pygame.draw.rect(self.screen, (54, 134, 170), self.popup_close_rect, width=2, border_radius=8)
-            close_txt = self.font_small.render("Close", True, TEXT_PRIMARY)
-            self.screen.blit(close_txt, close_txt.get_rect(center=self.popup_close_rect.center))
-        else:
-            self.popup_analysis_prev_rect = None
-            self.popup_analysis_next_rect = None
-            self.popup_analysis_back_rect = None
-
-            self.screen.blit(self.font_title.render(self.end_title or "Game Ended", True, TEXT_PRIMARY), (popup_rect.x + 24, popup_rect.y + 20))
-            self.screen.blit(self.font_body.render(f"Reason: {self.end_reason}", True, TEXT_MUTED), (popup_rect.x + 26, popup_rect.y + 70))
-            self.screen.blit(self.font_small.render(f"Total half-moves: {len(self.move_history)}", True, TEXT_MUTED), (popup_rect.x + 26, popup_rect.y + 102))
-            session_line = (
-                f"Session Score  {self.user_name}: {self.session_user_wins}  "
-                f"{self.ai_name}: {self.session_ai_wins}  Draw: {self.session_draws}"
-            )
-            self.screen.blit(self.font_small.render(session_line, True, TEXT_MUTED), (popup_rect.x + 26, popup_rect.y + 124))
-
-            if self.analysis_in_progress:
-                self.screen.blit(self.font_body.render("Analyzing move quality...", True, ACCENT), (popup_rect.x + 26, popup_rect.y + 156))
-                self.screen.blit(self.font_small.render("The game is finished. Stats are loading in background.", True, TEXT_MUTED), (popup_rect.x + 26, popup_rect.y + 194))
-            else:
-                user = self.postgame_stats["user"]
-                ai = self.postgame_stats["ai"]
-                user_line = f"{self.user_name}  Best: {user['best']}  Normal: {user['normal']}  Worst: {user['worst']}"
-                ai_line = f"{self.ai_name}  Best: {ai['best']}  Normal: {ai['normal']}  Worst: {ai['worst']}"
-                self.screen.blit(self.font_body.render(user_line, True, TEXT_PRIMARY), (popup_rect.x + 26, popup_rect.y + 156))
-                self.screen.blit(self.font_body.render(ai_line, True, TEXT_PRIMARY), (popup_rect.x + 26, popup_rect.y + 192))
-                self.screen.blit(self.font_small.render("Move quality uses AI evaluation deltas.", True, TEXT_MUTED), (popup_rect.x + 26, popup_rect.y + 228))
-
-            if self.rematch_choice_visible:
-                self.popup_analyze_rect = None
-                self.popup_export_rect = None
-                self.popup_rematch_rect = None
-                button_y = popup_rect.bottom - 22
-                prompt = self.font_body.render("Rematch: Continue or Switch side?", True, TEXT_PRIMARY)
-                prompt_y = button_y - 92
-                self.screen.blit(prompt, (popup_rect.x + 26, prompt_y))
-
-                self.popup_continue_rect = pygame.Rect(0, 0, 170, 42)
-                self.popup_continue_rect.midbottom = (popup_rect.centerx - 96, button_y)
-                pygame.draw.rect(self.screen, BUTTON_BG_HOVER, self.popup_continue_rect, border_radius=10)
-                pygame.draw.rect(self.screen, (54, 164, 170), self.popup_continue_rect, width=2, border_radius=10)
-                continue_txt = self.font_button.render("Continue", True, TEXT_PRIMARY)
-                self.screen.blit(continue_txt, continue_txt.get_rect(center=self.popup_continue_rect.center))
-
-                self.popup_switch_rect = pygame.Rect(0, 0, 170, 42)
-                self.popup_switch_rect.midbottom = (popup_rect.centerx + 96, button_y)
-                pygame.draw.rect(self.screen, BUTTON_BG, self.popup_switch_rect, border_radius=10)
-                pygame.draw.rect(self.screen, (54, 134, 170), self.popup_switch_rect, width=2, border_radius=10)
-                switch_txt = self.font_button.render("Switch Side", True, TEXT_PRIMARY)
-                self.screen.blit(switch_txt, switch_txt.get_rect(center=self.popup_switch_rect.center))
-
-                self.popup_close_rect = pygame.Rect(0, 0, 94, 34)
-                self.popup_close_rect.topright = (popup_rect.right - 16, popup_rect.y + 16)
-                pygame.draw.rect(self.screen, BUTTON_BG, self.popup_close_rect, border_radius=8)
-                pygame.draw.rect(self.screen, (54, 134, 170), self.popup_close_rect, width=2, border_radius=8)
-                close_txt = self.font_small.render("Close", True, TEXT_PRIMARY)
-                self.screen.blit(close_txt, close_txt.get_rect(center=self.popup_close_rect.center))
-            else:
-                self.popup_continue_rect = None
-                self.popup_switch_rect = None
-
-                button_y = popup_rect.bottom - 22
-                self.popup_rematch_rect = pygame.Rect(0, 0, 148, 42)
-                self.popup_rematch_rect.midbottom = (popup_rect.centerx - 86, button_y)
-                pygame.draw.rect(self.screen, BUTTON_BG_HOVER, self.popup_rematch_rect, border_radius=10)
-                pygame.draw.rect(self.screen, (54, 164, 170), self.popup_rematch_rect, width=2, border_radius=10)
-                rematch_txt = self.font_button.render("Rematch", True, TEXT_PRIMARY)
-                self.screen.blit(rematch_txt, rematch_txt.get_rect(center=self.popup_rematch_rect.center))
-
-                self.popup_close_rect = pygame.Rect(0, 0, 118, 42)
-                self.popup_close_rect.midbottom = (popup_rect.centerx + 86, button_y)
-                pygame.draw.rect(self.screen, BUTTON_BG, self.popup_close_rect, border_radius=10)
-                pygame.draw.rect(self.screen, (54, 134, 170), self.popup_close_rect, width=2, border_radius=10)
-                close_txt = self.font_button.render("Close", True, TEXT_PRIMARY)
-                self.screen.blit(close_txt, close_txt.get_rect(center=self.popup_close_rect.center))
-
-                second_row_y = button_y - 56
-                self.popup_analyze_rect = pygame.Rect(0, 0, 148, 40)
-                self.popup_analyze_rect.midbottom = (popup_rect.centerx - 86, second_row_y)
-                pygame.draw.rect(self.screen, BUTTON_BG, self.popup_analyze_rect, border_radius=10)
-                pygame.draw.rect(self.screen, (54, 134, 170), self.popup_analyze_rect, width=2, border_radius=10)
-                analyze_txt = self.font_small.render("Analyze Game", True, TEXT_PRIMARY)
-                self.screen.blit(analyze_txt, analyze_txt.get_rect(center=self.popup_analyze_rect.center))
-
-                self.popup_export_rect = pygame.Rect(0, 0, 148, 40)
-                self.popup_export_rect.midbottom = (popup_rect.centerx + 86, second_row_y)
-                pygame.draw.rect(self.screen, BUTTON_BG, self.popup_export_rect, border_radius=10)
-                pygame.draw.rect(self.screen, (54, 134, 170), self.popup_export_rect, width=2, border_radius=10)
-                export_txt = self.font_small.render("Export PGN", True, TEXT_PRIMARY)
-                self.screen.blit(export_txt, export_txt.get_rect(center=self.popup_export_rect.center))
-
-                hotkey_txt = self.font_small.render("Tip: press R for rematch", True, TEXT_MUTED)
-                tip_y = second_row_y - 72
-                self.screen.blit(hotkey_txt, (popup_rect.x + 26, tip_y))
-                popup_notice_y = second_row_y - 52
-
-        if self.popup_notice and time.time() < self.popup_notice_until:
-            note = self.font_small.render(self.popup_notice, True, ACCENT)
-            self.screen.blit(note, (popup_rect.x + 26, popup_notice_y))
-
-    def _draw_start_setup_screen(self) -> None:
-        # Dimmed backdrop with centered setup card.
-        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 120))
-        self.screen.blit(overlay, (0, 0))
-
-        panel = pygame.Surface((self.setup_panel_rect.width, self.setup_panel_rect.height), pygame.SRCALPHA)
-        pygame.draw.rect(panel, (10, 42, 62, 238), panel.get_rect(), border_radius=14)
-        pygame.draw.rect(panel, (60, 134, 166, 220), panel.get_rect(), width=2, border_radius=14)
-        self.screen.blit(panel, self.setup_panel_rect.topleft)
-
-        title = self.font_panel_title.render("Choose Your Side", True, TEXT_PRIMARY)
-        self.screen.blit(title, (self.setup_panel_rect.x + 18, self.setup_panel_rect.y + 16))
-
-        opp = self.font_small.render("Opponent: Cortex64", True, TEXT_MUTED)
-        self.screen.blit(opp, (self.setup_panel_rect.right - opp.get_width() - 18, self.setup_panel_rect.y + 24))
-
-        user_avatar = self._get_user_avatar(46)
-        self.screen.blit(user_avatar, (self.setup_panel_rect.x + 26, self.setup_panel_rect.y + 76))
-
-        pygame.draw.rect(self.screen, (14, 58, 82), self.setup_name_input_rect, border_radius=8)
-        pygame.draw.rect(
-            self.screen,
-            ACCENT if self.editing_name else (64, 115, 141),
-            self.setup_name_input_rect,
-            width=2,
-            border_radius=8,
-        )
-        name_text = self.user_name if self.user_name else "Soprano"
-        caret = "|" if self.editing_name and int(time.time() * 2) % 2 == 0 else ""
-        name_label = self.font_player.render(name_text + (caret if self.editing_name else ""), True, TEXT_PRIMARY)
-        self.screen.blit(
-            name_label,
-            (
-                self.setup_name_input_rect.x + 8,
-                self.setup_name_input_rect.y + (self.setup_name_input_rect.height - name_label.get_height()) // 2,
-            ),
-        )
-
-        instruction = self.font_small.render("Pick color: White moves first, Black gives AI first move.", True, TEXT_MUTED)
-        self.screen.blit(instruction, (self.setup_panel_rect.x + 26, self.setup_panel_rect.y + 142))
-        preferred = "White" if self.human_color == WHITE else "Black"
-        pref_txt = self.font_small.render(f"Preferred side: {preferred}", True, TEXT_MUTED)
-        self.screen.blit(pref_txt, (self.setup_panel_rect.x + 26, self.setup_panel_rect.y + 162))
-
-        mouse = pygame.mouse.get_pos()
-        for rect, label, color in (
-            (self.setup_white_rect, "Play White", (235, 239, 244)),
-            (self.setup_black_rect, "Play Black", (236, 245, 250)),
-        ):
-            hover = rect.collidepoint(mouse)
-            base = BUTTON_BG_HOVER if hover else BUTTON_BG
-            pygame.draw.rect(self.screen, base, rect, border_radius=10)
-            pygame.draw.rect(self.screen, (54, 134, 170), rect, width=2, border_radius=10)
-            txt = self.font_button.render(label, True, color)
-            self.screen.blit(txt, txt.get_rect(center=rect.center))
-
-        hotkeys = self.font_small.render("Hotkeys: W = White, B = Black", True, TEXT_MUTED)
-        self.screen.blit(hotkeys, (self.setup_panel_rect.x + 26, self.setup_panel_rect.bottom - 26))
-
-    def draw(self) -> None:
-        self.screen.blit(self.background, (0, 0))
-        if self.awaiting_start_choice:
-            self._draw_start_setup_screen()
+        now = pygame.time.get_ticks()
+        if now >= self.hint_fade_end:
+            self.hint_move = None
+            self.hint_explanation = ""
             return
+        alpha = 220 if now <= self.hint_until else int(220 * (self.hint_fade_end - now) / ANIM_FADE_MS)
+        draw_arrow(surface, self._square_center(self.hint_move.from_sq), self._square_center(self.hint_move.to_sq), GOLD, width=12, alpha=alpha)
 
-        self._draw_player_cards()
-        self._draw_board()
-        self._draw_last_move()
-        self._draw_pieces()
-        self._draw_selected_square()
-        self._draw_legal_move_hints()
-        self._draw_hint_arrow()
-        self._draw_coordinates()
-        self._draw_sidebar()
-        self._draw_postgame_popup()
+    def _draw_banner(self, surface: pygame.Surface) -> None:
+        if not self.banner_text or pygame.time.get_ticks() >= self.banner_until:
+            return
+        banner = pygame.Rect(0, 0, 240, 40)
+        banner.midtop = (640, 18)
+        pygame.draw.rect(surface, DANGER if self.banner_text == "CHECK!" else BG_CARD, banner, border_radius=20)
+        pygame.draw.rect(surface, ACCENT if self.banner_text != "CHECK!" else DANGER, banner, width=1, border_radius=20)
+        txt = self.body_font.render(self.banner_text, True, WHITE_COL)
+        surface.blit(txt, txt.get_rect(center=banner.center))
 
-    def run(self) -> None:
-        while True:
-            self.clock.tick(self.fps)
-            for event in pygame.event.get():
-                self.handle_event(event)
-            self._poll_ai_result()
-            self._poll_postgame_analysis()
-            self._start_ai_search()
-            self.draw()
-            pygame.display.flip()
+    def _draw_confirm(self, surface: pygame.Surface) -> None:
+        if not self.confirm_resign:
+            return
+        overlay = pygame.Surface((1280, 800), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        surface.blit(overlay, (0, 0))
+        dialog = pygame.Rect(0, 0, 320, 160)
+        dialog.center = (640, 400)
+        pygame.draw.rect(surface, BG_CARD, dialog, border_radius=20)
+        pygame.draw.rect(surface, DANGER, dialog, width=2, border_radius=20)
+        title = self.title_font.render("Confirm resignation?", True, WHITE_COL)
+        body = self.body_font.render("This will immediately end the game.", True, MUTED)
+        surface.blit(title, title.get_rect(center=(dialog.centerx, dialog.y + 46)))
+        surface.blit(body, body.get_rect(center=(dialog.centerx, dialog.y + 82)))
+        self.confirm_yes.draw(surface)
+        self.confirm_no.draw(surface)
 
-
-def main() -> None:
-    Game().run()
-
-
-if __name__ == "__main__":
-    main()
+    def draw(self, surface: pygame.Surface) -> None:
+        surface.fill(BG_DARK)
+        self._draw_sidebars(surface)
+        self._draw_board(surface)
+        self._draw_hint(surface)
+        self._draw_banner(surface)
+        self._draw_confirm(surface)
+        if self.results_pending:
+            self.results_pending = False
+            self.results_ready = True

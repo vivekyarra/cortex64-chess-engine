@@ -1,0 +1,8 @@
+{
+  "skin_index": 0,
+  "sound": true,
+  "animations": "normal",
+  "show_legal_moves": true,
+  "show_eval_bar": true,
+  "font_size": "normal"
+}
